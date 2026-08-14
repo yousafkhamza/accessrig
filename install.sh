@@ -344,6 +344,7 @@ LAYOUT=""
 REAL_INSTALLER_DIR=""
 REAL_ENV_FILE=""
 REAL_COMPOSE_ARGS=()
+REAL_PROJECT_NAME=""
 COMPOSE_FILES=()
 CURRENT_VERSION_FROM_DOCKER=""
 
@@ -353,11 +354,15 @@ detect_real_layout() {
   REAL_ENV_FILE=""
   REAL_COMPOSE_ARGS=()
   COMPOSE_FILES=()
+  REAL_PROJECT_NAME=""
 
-  local label_files=""
+  local label_files="" label_project=""
   for probe_container in jms_core jms_web jms_lion; do
     label_files="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$probe_container" 2>/dev/null || true)"
-    [[ -n "$label_files" && "$label_files" != "<no value>" ]] && break
+    if [[ -n "$label_files" && "$label_files" != "<no value>" ]]; then
+      label_project="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$probe_container" 2>/dev/null || true)"
+      break
+    fi
   done
 
   if [[ -n "$label_files" && "$label_files" != "<no value>" ]]; then
@@ -372,7 +377,20 @@ detect_real_layout() {
       if [[ -f "$REAL_ENV_FILE" ]]; then
         LAYOUT="jumpserver-installer"
         COMPOSE_FILES=("${_compose_files[@]}")
+        # The real Compose project name — critical to get right. Without
+        # explicitly passing -p, Compose infers a project name from the
+        # basename of the directory holding the FIRST -f file (here,
+        # literally "compose/"), which is NOT the project name the live
+        # deployment actually uses. Getting this wrong makes every command
+        # operate in a different, wrong project namespace — attempting to
+        # create a rival network instead of joining the real one, and
+        # potentially creating parallel containers instead of updating the
+        # real ones. Confirmed this the hard way against a live box.
+        if [[ -n "$label_project" && "$label_project" != "<no value>" ]]; then
+          REAL_PROJECT_NAME="$label_project"
+        fi
         REAL_COMPOSE_ARGS=(--env-file "$REAL_ENV_FILE")
+        [[ -n "$REAL_PROJECT_NAME" ]] && REAL_COMPOSE_ARGS+=(-p "$REAL_PROJECT_NAME")
         for f in "${_compose_files[@]}"; do
           REAL_COMPOSE_ARGS+=(-f "$f")
         done
@@ -402,6 +420,15 @@ detect_real_layout() {
 # ---------------------------------------------------------------------------
 apply_lion_audio_fix() {
   [[ "$LAYOUT" == "jumpserver-installer" ]] || return 0
+
+  if [[ -z "$REAL_PROJECT_NAME" ]]; then
+    warn "Could not determine the real Compose project name for this deployment"
+    warn "(the com.docker.compose.project label wasn't found on jms_core). Skipping"
+    warn "the GUAC_AUDIO fix rather than guessing — running compose commands with the"
+    warn "wrong project name can create a rival network or duplicate containers."
+    warn "Check manually with: docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project\" }}' jms_core"
+    return 0
+  fi
 
   local fix_dir="${REAL_INSTALLER_DIR}/.accessrig/lion-audio-fix"
   if [[ -f "${fix_dir}/docker-compose.override.yml" ]] && docker ps --format '{{.Names}}' | grep -qx "accessrig-lion-audio-fix"; then
@@ -479,6 +506,13 @@ EOF
   for ef in "${REAL_INSTALLER_DIR}/.env" "${REAL_INSTALLER_DIR}"/*.env; do
     [[ -f "$ef" ]] && compose_args+=(--env-file "$ef")
   done
+  # Critical: pin the project name to what the live deployment actually uses.
+  # Without this, Compose infers it from the "compose/" directory basename
+  # instead, and every command below operates in a different, wrong project —
+  # attempting to create a rival network instead of joining the real one.
+  # This was the actual cause of "Pool overlaps with other one on this
+  # address space" seen on a live box.
+  [[ -n "$REAL_PROJECT_NAME" ]] && compose_args+=(-p "$REAL_PROJECT_NAME")
   for f in "${COMPOSE_FILES[@]}"; do
     compose_args+=(-f "$f")
   done
