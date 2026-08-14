@@ -59,7 +59,7 @@ INTERACTIVE=false
 FORCE_VERSION=""     # pin to a specific tag instead of "latest"
 LIST_VERSIONS=false
 CONFIRM_DOWNGRADE=false
-ENABLE_BRANDING_PROXY=true
+ENABLE_BRANDING_PROXY=false   # opt-in — cosmetic only, most setups don't need it
 DRY_RUN=false
 
 log()  { echo -e "\033[1;36m[accessrig]\033[0m $*"; }
@@ -126,6 +126,7 @@ while [[ $# -gt 0 ]]; do
     --version)      FORCE_VERSION="$2"; shift 2 ;;
     --list-versions) LIST_VERSIONS=true; shift ;;
     --confirm-downgrade) CONFIRM_DOWNGRADE=true; shift ;;
+    --enable-branding-proxy) ENABLE_BRANDING_PROXY=true; shift ;;
     --no-branding-proxy) ENABLE_BRANDING_PROXY=false; shift ;;
     --interactive)  INTERACTIVE=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;

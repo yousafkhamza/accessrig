@@ -83,7 +83,7 @@ Data is never deleted by default — you have to explicitly opt in with `--purge
 
 ### Why org branding and S3 aren't fully automated
 
-Digging into JumpServer's docs before writing this: **logo/title/theme customization ("Appearance") is an Enterprise Edition–only feature** — Community edition has no supported UI or public API to change it. `scripts/branding-proxy.sh` gets you the cosmetic effect anyway via an nginx sidecar that text-substitutes "JumpServer" → your org name in outgoing HTML (`sub_filter`), which survives upgrades since it never touches JumpServer's own containers. It's clearly optional and off with `--no-branding-proxy`.
+Digging into JumpServer's docs before writing this: **logo/title/theme customization ("Appearance") is an Enterprise Edition–only feature** — Community edition has no supported UI or public API to change it. `scripts/branding-proxy.sh` gets you the cosmetic effect anyway via an nginx sidecar that text-substitutes "JumpServer" → your org name in outgoing HTML (`sub_filter`), which survives upgrades since it never touches JumpServer's own containers. It's **off by default** — most setups don't need it — pass `--enable-branding-proxy` if you want it.
 
 S3 storage backend configuration also has no stable public API across Community versions, so scripting it would be more likely to silently break on a version bump than save you time. The script prints the exact `Settings → Storage → Object Storage → S3` steps and the IAM policy (`docs/s3-policy.json`) to attach to the instance role.
 
@@ -95,7 +95,8 @@ JumpServer published advisory **JS-2026.7.29** covering four CVEs (Fastjson dese
 
 ```
 install.sh                          # entrypoint — install or update, auto-detected
-scripts/branding-proxy.sh           # optional org-name cosmetic proxy
+scripts/branding-proxy.sh           # optional org-name cosmetic proxy (off by default)
+scripts/lion-audio-fix.sh           # fixes the RDP black-screen / GUAC_AUDIO bug
 docs/s3-policy.json                 # IAM policy for the recordings bucket
 docs/index.html                     # GitHub Pages landing page
 config/accessrig.env.example
@@ -103,6 +104,26 @@ config/accessrig.env.example
 ```
 
 Server user provisioning (create `admin-pam`/`editor-pam`/`readonly-pam` via SSM) lives in a separate toolkit, not this repo — see [jms-user-provisioning](https://github.com/yousafkhamza/jms-user-provisioning).
+
+## Fixing the RDP black-screen bug (GUAC_AUDIO)
+
+If RDP connections through JumpServer show a black screen and Lion's logs contain:
+
+```
+5.audio,1.1,31.audio/L16; instruction with bad Content: 5.audio,1.1,31.audio/L16
+```
+
+This is a known upstream bug (matches [jumpserver/jumpserver#13156](https://github.com/jumpserver/jumpserver/issues/13156) and [#13799](https://github.com/jumpserver/jumpserver/issues/13799)) — Luna's client-side JS always appends `GUAC_AUDIO=audio/L8&GUAC_AUDIO=audio/L16` to every RDP connect request, and Lion's protocol parser chokes on it. There's no platform-level toggle for this; it isn't configurable from the JumpServer UI.
+
+```bash
+sudo ./scripts/lion-audio-fix.sh
+```
+
+This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified. It requires the same one manual step as the branding proxy (moving `jms_nginx`'s port mapping from `80:80` to `8081:80` in your compose file) for the same reason — that move can't be done safely without knowing your exact compose file layout.
+
+The Lua removal logic and the surrounding nginx config were both verified independently before shipping this: the query-string logic was tested against the literal request URL captured from a real browser DevTools session, confirming both `GUAC_AUDIO` values are removed while every other parameter (including `TOKEN_ID`) survives; the nginx config was validated with `nginx -t` down to a clean pass.
+
+If you also ran `branding-proxy.sh` earlier, remove it first — you don't want two proxies both trying to bind port 80. `lion-audio-fix.sh` prints the exact teardown command for that at the end of its output.
 
 ## Enabling GitHub Pages on your fork
 
