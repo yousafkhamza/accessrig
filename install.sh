@@ -289,19 +289,25 @@ list_versions() {
   log "Currently installed on this box: ${installed:-none — fresh box}"
   log "Fetching recent JumpServer releases from GitHub..."
   echo ""
-  printf "%-22s %-14s %s\n" "TAG" "PUBLISHED" "NOTE"
+  # NOTE column shows the release NAME (e.g. "v4.10.18-lts") when it differs
+  # from the TAG (e.g. "v4.10.18") — GitHub keeps these as two separate
+  # fields: tag_name is what --version actually pins to and what the
+  # download URL uses, name is the human-readable title shown on the
+  # releases page (usually the one with "-lts" in it). Use the TAG value
+  # with --version, not the NAME.
+  printf "%-16s %-20s %-14s %s\n" "TAG" "RELEASE NAME" "PUBLISHED" "NOTE"
   curl -fsSL "https://api.github.com/repos/${JUMPSERVER_REPO}/releases?per_page=30" \
-    | jq -r '.[] | [.tag_name, (.published_at // "" | split("T")[0]), (.prerelease | tostring)] | @tsv' \
-    | while IFS=$'\t' read -r tag published prerelease; do
+    | jq -r '.[] | [.tag_name, (.name // .tag_name), (.published_at // "" | split("T")[0]), (.prerelease | tostring)] | @tsv' \
+    | while IFS=$'\t' read -r tag rel_name published prerelease; do
         note=""
         [[ "$prerelease" == "true" ]] && note="pre-release"
         if [[ -n "$installed" && "$tag" == "$installed" ]]; then
           note="${note:+$note, }CURRENTLY INSTALLED"
         fi
-        printf "%-22s %-14s %s\n" "$tag" "$published" "$note"
+        printf "%-16s %-20s %-14s %s\n" "$tag" "$rel_name" "$published" "$note"
       done
   echo ""
-  log "Install/pin a specific one with: --version <tag>   (e.g. --version v4.10.17)"
+  log "Install/pin a specific one with: --version <tag>   — use the TAG column, e.g. --version v4.10.17"
 }
 
 # Compares two version tags (handles v-prefix and -lts suffix). Returns
