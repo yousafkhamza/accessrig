@@ -19,26 +19,65 @@
 # leaves everything else (headers, body, all other routes) completely alone.
 #
 # Usage:
-#   sudo ./lion-audio-fix.sh              # install/apply the fix
-#   sudo ./lion-audio-fix.sh --remove     # stop and remove the sidecar (e.g. before upgrading JumpServer)
+#   sudo ./lion-audio-fix.sh                          # install/apply the fix
+#   sudo ./lion-audio-fix.sh --remove                 # stop and remove the sidecar (e.g. before upgrading JumpServer)
+#   sudo ./lion-audio-fix.sh --compose-file /path/to/compose.yml   # override auto-detection
 #
 set -euo pipefail
 
 JMS_DIR="/opt/jumpserver"
 FIX_DIR="${JMS_DIR}/.accessrig/lion-audio-fix"
 MODE="apply"
+COMPOSE_FILE_OVERRIDE=""
 
 log()  { echo -e "\033[1;36m[lion-audio-fix]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[lion-audio-fix][warn]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[lion-audio-fix][error]\033[0m $*" >&2; exit 1; }
 
-[[ "${1:-}" == "--remove" ]] && MODE="remove"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remove) MODE="remove"; shift ;;
+    --compose-file) COMPOSE_FILE_OVERRIDE="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
 
 [[ $EUID -eq 0 ]] || die "Run this as root or with sudo."
 
-COMPOSE_FILE="${JMS_DIR}/compose.yml"
-[[ -f "$COMPOSE_FILE" ]] || COMPOSE_FILE="${JMS_DIR}/docker-compose.yml"
-[[ -f "$COMPOSE_FILE" ]] || die "Could not find compose.yml/docker-compose.yml under ${JMS_DIR}. Check the path and re-run manually."
+# Docker itself always knows exactly which compose file(s) it used to bring
+# up a project — reading that label is far more reliable than guessing
+# filenames, since quick_start.sh's exact layout has varied across versions.
+detect_compose_file() {
+  if [[ -n "$COMPOSE_FILE_OVERRIDE" ]]; then
+    echo "$COMPOSE_FILE_OVERRIDE"
+    return
+  fi
+
+  local label_files=""
+  for probe_container in jms_core jms_nginx jms_lion; do
+    label_files="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$probe_container" 2>/dev/null || true)"
+    [[ -n "$label_files" && "$label_files" != "<no value>" ]] && break
+  done
+
+  if [[ -n "$label_files" && "$label_files" != "<no value>" ]]; then
+    # Can be a comma-separated list if multiple -f files were used at deploy time.
+    echo "$label_files" | tr ',' '\n' | head -n1
+    return
+  fi
+
+  # Fallback: the filenames quick_start.sh has used across versions.
+  for candidate in "${JMS_DIR}/compose.yml" "${JMS_DIR}/docker-compose.yml" "${JMS_DIR}/compose.yaml" "${JMS_DIR}/docker-compose.yaml"; do
+    [[ -f "$candidate" ]] && { echo "$candidate"; return; }
+  done
+}
+
+COMPOSE_FILE="$(detect_compose_file)"
+if [[ -z "$COMPOSE_FILE" || ! -f "$COMPOSE_FILE" ]]; then
+  die "Could not auto-detect the compose file. Find it yourself with:
+    docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project.config_files\" }}' jms_core
+  then re-run with: sudo ./lion-audio-fix.sh --compose-file /the/actual/path.yml"
+fi
+log "Using compose file: ${COMPOSE_FILE}"
 
 if [[ "$MODE" == "remove" ]]; then
   if [[ ! -f "${FIX_DIR}/docker-compose.override.yml" ]]; then
