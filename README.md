@@ -23,43 +23,27 @@ curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s --
 
 Re-running the **same command** later automatically detects the existing install (via `/opt/jumpserver/.accessrig/install.json`) and switches to update mode instead — see below.
 
-## Update (in place, zero data loss)
+## Update (in place, layout-aware, GUAC_AUDIO fix applied automatically)
 
 ```bash
 curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash
 ```
 
-What "zero data loss" actually means here: JumpServer's MySQL/Redis data and your config live under `/opt/jumpserver`, which is a bind mount on the host, not inside a container. Upgrading only replaces container images — it never deletes that directory. AccessRig additionally tars the whole directory to `/opt/jumpserver/backups/` before every upgrade attempt, so a failed upgrade has a one-command rollback path.
+**This section was rewritten from scratch after finding out the hard way that `install.sh`'s original update flow (based on `quick_start.sh`) doesn't match how modern JumpServer actually deploys.** The real layout, confirmed against a live box:
 
-### Full upgrade runbook (v4.10.17 → latest, accounting for lion-audio-fix)
+- A **versioned** installer directory — `/opt/jumpserver-installer-v<X.Y.Z>/` — that changes on every upgrade, containing 9 separate compose files under `compose/`, an `.env` file, and its own `jmsctl.sh` management script.
+- Real upgrades go through **`jmsctl.sh upgrade` && `jmsctl.sh start`**, which does its own database backup natively to `/data/jumpserver/db_backup/` — this is the tool's own correct mechanism, confirmed from JumpServer's own documentation, not something AccessRig needs to duplicate.
 
-If you've applied `lion-audio-fix.sh`, remove it **before** upgrading — it changed `jms_nginx`'s port mapping, and you don't want a stale sidecar fighting the upgrade for port 80:
+`install.sh` now detects this automatically (same Docker-label technique used everywhere else in this repo) and branches:
 
-```bash
-# 1. Check what's currently installed and what's newer
-curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --list-versions
+- **`jumpserver-installer` layout** (what you're almost certainly on): downloads the new version from `jumpserver/installer`'s releases, extracts it to a fresh versioned directory, runs `jmsctl.sh upgrade` then `jmsctl.sh start`. Any `(y/n)` confirmation prompt is auto-answered `y` for unattended runs (pass `--interactive` to answer it yourself instead).
+- **Older `quick_start.sh` single-directory layout**: keeps the original tar-backup-then-`quick_start.sh` flow, for anyone genuinely still on that model. The backup step also had a real bug fixed here — the `--exclude` pattern was an absolute path being matched against tar's relative internal paths under `-C`, so it never actually excluded the backups directory, causing "file changed as we read it" and endlessly growing backup files. Fixed to match correctly (verified with a real `tar` run, not just eyeballed).
 
-# 1b. Check whether lion-audio-fix is currently applied on this box
-docker ps --filter name=accessrig-lion-audio-fix --format '{{.Names}}: {{.Status}}'
-# empty output = not applied, skip straight to step 3
+**The GUAC_AUDIO / RDP black-screen fix is now applied automatically** — after every install, after every upgrade, and even when there's *nothing* to upgrade. That last case matters most if you installed via AccessRig before this fix existed: just re-run the same command with no flags, and it'll detect the fix isn't applied yet and apply it, without needing to separately remember `lion-audio-fix.sh` exists. It's idempotent either way — safe to run repeatedly, skips instantly once applied.
 
-# 2. If step 1b showed it running, remove it first
-#    (run it from wherever you keep your AccessRig checkout on this server)
-sudo ./scripts/lion-audio-fix.sh --remove
+The standalone `scripts/lion-audio-fix.sh` still exists for ad-hoc use (e.g. `--remove` before some other maintenance), but you shouldn't need to reach for it manually anymore as part of a normal install/upgrade.
 
-# 3. Do the actual upgrade — no version pin needed to just take the latest
-curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash
-
-# 4. Test the RDP connection that was showing a black screen.
-#    v4.10.18 may or may not have fixed the underlying Lion bug — there's no
-#    changelog line confirming it either way, so this is a real test, not
-#    a formality.
-
-# 5. Only if it's STILL black-screening after the upgrade, reapply the fix:
-sudo ./lion-audio-fix.sh
-```
-
-This order matters: skipping step 2 means the port-80 sidecar container is still bound when `quick_start.sh` (called internally by the upgrade) tries to bring `jms_nginx` back up on its normal port — that's a conflict you'd rather avoid than debug.
+All of this — layout detection, the `jmsctl.sh` flow, the pipefail bug in auto-confirming the prompt (`yes | cmd` fails under `set -o pipefail` once the reader stops early; switched to `printf 'y\n' | cmd`), and the automatic audio-fix application including the "already on latest" case — was tested end-to-end against a simulated environment built from real command output before shipping, not just read over and assumed correct.
 
 ## Choosing a specific version instead of always "latest"
 
@@ -135,7 +119,9 @@ config/accessrig.env.example
 
 Server user provisioning (create `admin-pam`/`editor-pam`/`readonly-pam` via SSM) lives in a separate toolkit, not this repo — see [jms-user-provisioning](https://github.com/yousafkhamza/jms-user-provisioning).
 
-## Fixing the RDP black-screen bug (GUAC_AUDIO)
+## The RDP black-screen bug (GUAC_AUDIO) — now fixed automatically
+
+**As of the install.sh rewrite above, you don't need to do anything for this anymore** — it's applied automatically after install, after upgrade, and even on a plain re-run with nothing to upgrade. This section is background on what it does and how, plus the standalone script for ad-hoc use.
 
 If RDP connections through JumpServer show a black screen and Lion's logs contain:
 
@@ -145,13 +131,15 @@ If RDP connections through JumpServer show a black screen and Lion's logs contai
 
 This is a known upstream bug (matches [jumpserver/jumpserver#13156](https://github.com/jumpserver/jumpserver/issues/13156) and [#13799](https://github.com/jumpserver/jumpserver/issues/13799)) — Luna's client-side JS always appends `GUAC_AUDIO=audio/L8&GUAC_AUDIO=audio/L16` to every RDP connect request, and Lion's protocol parser chokes on it. There's no platform-level toggle for this; it isn't configurable from the JumpServer UI.
 
+**Standalone script**, for cases outside the normal install/upgrade flow (e.g. removing it temporarily for unrelated maintenance):
+
 ```bash
-sudo ./scripts/lion-audio-fix.sh                    # apply (fully automated, no manual steps)
-sudo ./scripts/lion-audio-fix.sh --remove           # remove (e.g. before upgrading JumpServer)
+sudo ./scripts/lion-audio-fix.sh                    # apply manually
+sudo ./scripts/lion-audio-fix.sh --remove           # remove
 sudo ./scripts/lion-audio-fix.sh --alt-port 18080   # customize the port jms_web moves to (default 18080)
 ```
 
-This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified.
+This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified. The exact same logic is folded directly into `install.sh` now, so both stay in sync by construction rather than by remembering to update two files.
 
 ### Real container layout (confirmed against a live jumpserver-installer deployment)
 
@@ -192,19 +180,17 @@ sudo ./scripts/lion-audio-fix.sh --compose-files "/path/a.yml,/path/b.yml,/path/
 
 If you also ran `branding-proxy.sh` earlier, remove it first — you don't want two proxies both trying to bind port 80. Note: `branding-proxy.sh` still has the old `jms_nginx` assumption baked in and hasn't been corrected the same way — treat it as unverified against the `jumpserver-installer` layout until it has been.
 
-### ⚠️ Worth checking if you're on the jumpserver-installer layout
+### ⚠️ `uninstall.sh` is still on the old assumption — `install.sh` is fixed
 
-`install.sh`/`uninstall.sh` in this repo still assume the older `/opt/jumpserver` single-directory layout for backups and data (`ACCESSRIG_HOME="/opt/jumpserver"`). If your box uses the versioned `jumpserver-installer` layout instead (check with the `docker inspect` command above), **the backup step in `install.sh`'s update flow may have been backing up the wrong directory** — worth confirming before you trust it for anything important:
+`install.sh` now correctly detects and handles both layouts (see the "Update" section above — this was the whole point of tonight's rewrite). `uninstall.sh` has **not** been updated the same way yet — it still assumes the older single-directory `/opt/jumpserver` layout for backups and data removal. If you're on the `jumpserver-installer` layout and need to uninstall, don't trust `uninstall.sh`'s `--purge-data` yet; verify what it would actually delete first, or ask for it to be fixed the same way before relying on it.
 
 ```bash
 # Compare what's actually in each — if /opt/jumpserver is nearly empty while
 # the real data (postgres volumes, config, recordings) is under the versioned
-# installer directory, the backup path needs fixing before your next upgrade.
+# installer directory, uninstall.sh's --purge-data is deleting the wrong thing.
 ls -la /opt/jumpserver 2>/dev/null
 ls -la /opt/jumpserver-installer-v*/  2>/dev/null
 ```
-
-I haven't fixed this in `install.sh`/`uninstall.sh` yet — flagging it here rather than silently leaving a gap, since it affects the "zero data loss" guarantee those scripts claim. If your box turns out to be on this layout, say so and I'll rework the backup/data-path detection to match the same Docker-label approach used here.
 
 ## Enabling GitHub Pages on your fork
 

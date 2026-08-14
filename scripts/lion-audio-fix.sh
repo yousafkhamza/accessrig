@@ -104,7 +104,14 @@ FIX_DIR="${INSTALLER_DIR}/.accessrig/lion-audio-fix"
 ENV_FILE="${INSTALLER_DIR}/.env"
 log "Installer directory: ${INSTALLER_DIR}"
 
-COMPOSE_ARGS=()
+[[ -f "$ENV_FILE" ]] || die "Expected .env at ${ENV_FILE} but it's not there. Pass --compose-files if your layout differs, or handle the HTTP_PORT move manually."
+
+# --env-file matters here: docker compose only auto-loads .env from the
+# CURRENT WORKING DIRECTORY by default, not from wherever the compose files
+# live — since this script can be run from anywhere, that env context has to
+# be passed explicitly or every variable in the compose files (HTTP_PORT
+# included) silently comes through blank.
+COMPOSE_ARGS=(--env-file "$ENV_FILE")
 for f in "${COMPOSE_FILES[@]}"; do
   COMPOSE_ARGS+=(-f "$f")
 done
@@ -121,11 +128,15 @@ if [[ "$MODE" == "remove" ]]; then
   docker compose "${COMPOSE_ARGS[@]}" -f "${FIX_DIR}/docker-compose.override.yml" stop accessrig-lion-audio-fix || true
   docker compose "${COMPOSE_ARGS[@]}" -f "${FIX_DIR}/docker-compose.override.yml" rm -f accessrig-lion-audio-fix || true
 
-  if [[ -f "${ENV_FILE}" ]] && grep -q "^HTTP_PORT=${ALT_PORT}$" "$ENV_FILE" 2>/dev/null; then
+  if grep -q "^HTTP_PORT=${ALT_PORT}$" "$ENV_FILE" 2>/dev/null; then
     log "Reverting HTTP_PORT in ${ENV_FILE} back to 80..."
     sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=80/" "$ENV_FILE"
-    log "Recreating jms_web on port 80..."
-    docker compose "${COMPOSE_ARGS[@]}" up -d jms_web
+    # No specific service name targeted — docker ps shows CONTAINER names
+    # (jms_web), which aren't necessarily the same as the compose SERVICE key
+    # underneath. A plain "up -d" recreates only what actually changed
+    # (the web service, since HTTP_PORT moved) without needing to guess it.
+    log "Recreating whatever changed (should just be the web service)..."
+    docker compose "${COMPOSE_ARGS[@]}" up -d
   else
     warn "HTTP_PORT in ${ENV_FILE} doesn't match ${ALT_PORT} — leaving it as-is."
     warn "Check it manually if jms_web isn't reachable on port 80 after this."
@@ -137,7 +148,6 @@ fi
 # ---------------------------------------------------------------------------
 # APPLY
 # ---------------------------------------------------------------------------
-[[ -f "$ENV_FILE" ]] || die "Expected .env at ${ENV_FILE} but it's not there. Pass --compose-files if your layout differs, or handle the HTTP_PORT move manually."
 
 CURRENT_HTTP_PORT="$(grep '^HTTP_PORT=' "$ENV_FILE" | cut -d= -f2 || echo 80)"
 CURRENT_HTTP_PORT="${CURRENT_HTTP_PORT:-80}"
@@ -209,8 +219,8 @@ log "Moving jms_web off host port 80: HTTP_PORT ${CURRENT_HTTP_PORT} -> ${ALT_PO
 sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=${ALT_PORT}/" "$ENV_FILE"
 log "Backed up original .env to ${ENV_FILE}.accessrig-bak"
 
-log "Recreating jms_web on its new port..."
-docker compose "${COMPOSE_ARGS[@]}" up -d jms_web
+log "Recreating whatever changed (should just be the web service, since HTTP_PORT moved)..."
+docker compose "${COMPOSE_ARGS[@]}" up -d
 
 log "Starting the audio-fix sidecar on port 80..."
 docker compose "${COMPOSE_ARGS[@]}" -f "${FIX_DIR}/docker-compose.override.yml" up -d accessrig-lion-audio-fix

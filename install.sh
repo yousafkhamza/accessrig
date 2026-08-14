@@ -43,7 +43,8 @@ ACCESSRIG_HOME="/opt/jumpserver"
 ACCESSRIG_STATE_DIR="${ACCESSRIG_HOME}/.accessrig"
 ACCESSRIG_MARKER="${ACCESSRIG_STATE_DIR}/install.json"
 BACKUP_DIR="${ACCESSRIG_HOME}/backups"
-JUMPSERVER_REPO="jumpserver/jumpserver"          # upstream GitHub repo
+JUMPSERVER_REPO="jumpserver/jumpserver"          # upstream GitHub repo (quick_start.sh releases)
+INSTALLER_REPO="jumpserver/installer"            # separate repo: the jmsctl.sh-based installer tool
 QUICKSTART_URL_BASE="https://github.com/jumpserver/jumpserver/releases/latest/download"
 # Where to fetch sibling scripts (branding-proxy.sh) from when this file is run
 # via `curl | bash` — in that mode $0 has no real path, so a local relative
@@ -320,10 +321,158 @@ list_versions() {
 version_lt() {
   local a="${1#v}" b="${2#v}"
   a="${a%-lts}"; b="${b%-lts}"
+  a="${a%-ce}";  b="${b%-ce}"
+  a="${a%-ee}";  b="${b%-ee}"
   [[ "$a" == "$b" ]] && return 1
   local lowest
   lowest="$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)"
   [[ "$lowest" == "$a" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Layout detection — JumpServer has shipped two different deployment models:
+#   "jumpserver-installer": a VERSIONED directory (/opt/jumpserver-installer-
+#     v<X.Y.Z>/ — changes every upgrade), project split across multiple
+#     compose files under compose/, managed by that directory's own
+#     jmsctl.sh. This is what modern installs actually use.
+#   "legacy": the older quick_start.sh model — single /opt/jumpserver
+#     directory, one compose file.
+# Detected fresh every time via Docker's own compose label — never assumed,
+# never cached, since the versioned directory changes on every upgrade.
+# ---------------------------------------------------------------------------
+LAYOUT=""
+REAL_INSTALLER_DIR=""
+REAL_ENV_FILE=""
+REAL_COMPOSE_ARGS=()
+CURRENT_VERSION_FROM_DOCKER=""
+
+detect_real_layout() {
+  LAYOUT=""
+  REAL_INSTALLER_DIR=""
+  REAL_ENV_FILE=""
+  REAL_COMPOSE_ARGS=()
+
+  local label_files=""
+  for probe_container in jms_core jms_web jms_lion; do
+    label_files="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$probe_container" 2>/dev/null || true)"
+    [[ -n "$label_files" && "$label_files" != "<no value>" ]] && break
+  done
+
+  if [[ -n "$label_files" && "$label_files" != "<no value>" ]]; then
+    mapfile -t _compose_files < <(echo "$label_files" | tr ',' '\n')
+    local all_exist=true
+    for f in "${_compose_files[@]}"; do
+      [[ -f "$f" ]] || { all_exist=false; break; }
+    done
+    if [[ "$all_exist" == true && ${#_compose_files[@]} -gt 0 ]]; then
+      REAL_INSTALLER_DIR="$(dirname "$(dirname "${_compose_files[0]}")")"
+      REAL_ENV_FILE="${REAL_INSTALLER_DIR}/.env"
+      if [[ -f "$REAL_ENV_FILE" ]]; then
+        LAYOUT="jumpserver-installer"
+        REAL_COMPOSE_ARGS=(--env-file "$REAL_ENV_FILE")
+        for f in "${_compose_files[@]}"; do
+          REAL_COMPOSE_ARGS+=(-f "$f")
+        done
+      fi
+    fi
+  fi
+
+  if [[ -z "$LAYOUT" ]]; then
+    if [[ -f "${ACCESSRIG_HOME}/compose.yml" || -f "${ACCESSRIG_HOME}/docker-compose.yml" ]]; then
+      LAYOUT="legacy"
+    fi
+  fi
+
+  # Authoritative current version, straight from the running image tag —
+  # more reliable than any marker file, which can drift out of sync (as
+  # happened tonight).
+  CURRENT_VERSION_FROM_DOCKER="$(docker inspect --format '{{.Config.Image}}' jms_core 2>/dev/null | awk -F: '{print $NF}' || echo "")"
+}
+
+# ---------------------------------------------------------------------------
+# The GUAC_AUDIO / RDP-black-screen fix, folded in from the standalone
+# lion-audio-fix.sh — applied automatically after install/update, and
+# idempotent (safe to run every time; skips if already applied). Only runs
+# on the jumpserver-installer layout, where the real container names
+# (jms_web, jms_lion) and the .env HTTP_PORT mechanism this depends on were
+# actually confirmed against a live deployment.
+# ---------------------------------------------------------------------------
+apply_lion_audio_fix() {
+  [[ "$LAYOUT" == "jumpserver-installer" ]] || return 0
+
+  local fix_dir="${REAL_INSTALLER_DIR}/.accessrig/lion-audio-fix"
+  if [[ -f "${fix_dir}/docker-compose.override.yml" ]]; then
+    log "GUAC_AUDIO fix already applied for this installer directory — nothing to do."
+    return 0
+  fi
+
+  log "Applying the GUAC_AUDIO / RDP black-screen fix (audio strip proxy)..."
+  mkdir -p "$fix_dir"
+
+  cat > "${fix_dir}/nginx.conf" <<'NGINXEOF'
+server {
+    listen 80;
+    location /lion/ws/connect/ {
+        rewrite_by_lua_block {
+            local args = ngx.req.get_uri_args()
+            args["GUAC_AUDIO"] = nil
+            ngx.req.set_uri_args(args)
+        }
+        proxy_pass http://jms_lion:8081$uri?$args;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+    location / {
+        proxy_pass http://jms_web:80;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINXEOF
+
+  cat > "${fix_dir}/docker-compose.override.yml" <<EOF
+services:
+  accessrig-lion-audio-fix:
+    image: openresty/openresty:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ${fix_dir}/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - default
+EOF
+
+  local current_http_port
+  current_http_port="$(grep '^HTTP_PORT=' "$REAL_ENV_FILE" | cut -d= -f2 || echo 80)"
+  current_http_port="${current_http_port:-80}"
+  local alt_port=18080
+
+  if [[ "$current_http_port" == "$alt_port" ]]; then
+    warn "HTTP_PORT is already ${alt_port} — assuming the fix's port move already happened, just starting the sidecar."
+  else
+    log "Moving jms_web off host port 80: HTTP_PORT ${current_http_port} -> ${alt_port}"
+    sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=${alt_port}/" "$REAL_ENV_FILE"
+    log "Recreating whatever changed (should just be the web service)..."
+    docker compose "${REAL_COMPOSE_ARGS[@]}" up -d
+  fi
+
+  log "Starting the audio-fix sidecar on port 80..."
+  docker compose "${REAL_COMPOSE_ARGS[@]}" -f "${fix_dir}/docker-compose.override.yml" up -d accessrig-lion-audio-fix
+
+  log "GUAC_AUDIO fix applied. RDP connections should no longer black-screen."
 }
 
 # ---------------------------------------------------------------------------
@@ -397,17 +546,106 @@ EOF
 
   log "Install complete. UI: http://$(curl -s ifconfig.me 2>/dev/null || echo '<ec2-ip>')"
   log "Org name, timezone, S3 target are all recorded in ${ACCESSRIG_MARKER} for next time."
+
+  ensure_jq
+  detect_real_layout
+  apply_lion_audio_fix
 }
 
 # ---------------------------------------------------------------------------
-# Update flow — zero data loss: everything JumpServer needs lives under
-# /opt/jumpserver (docker volumes + this bind mount), so upgrading only means
-# swapping images, never touching that directory's data files.
+# Update flow — branches on the REAL detected layout rather than assuming.
+# jumpserver-installer layout uses the tool's own jmsctl.sh upgrade/start
+# (which does its own DB backup natively — verified from JumpServer's own
+# docs, no need to duplicate it). Legacy layout keeps the original
+# quick_start.sh-based flow. Either way, the GUAC_AUDIO fix is applied
+# automatically at the end — including when there's nothing to upgrade, so
+# boxes that installed via AccessRig before this fix existed get it just by
+# re-running this script.
 # ---------------------------------------------------------------------------
 do_update() {
   ensure_jq
+  detect_real_layout
+
+  if [[ "$LAYOUT" == "jumpserver-installer" ]]; then
+    do_update_jumpserver_installer
+  elif [[ "$LAYOUT" == "legacy" ]]; then
+    do_update_legacy
+  else
+    die "Could not detect a JumpServer deployment on this box (checked for jumpserver-installer and legacy quick_start.sh layouts). If containers are running under different names, this detection needs adjusting."
+  fi
+
+  # Re-detect: an installer-layout upgrade just moved to a NEW versioned
+  # directory, so REAL_INSTALLER_DIR from before the upgrade is stale.
+  detect_real_layout
+  apply_lion_audio_fix
+}
+
+do_update_jumpserver_installer() {
   local installed target_tag
-  installed=$(jq -r '.installed_version' "$ACCESSRIG_MARKER")
+  installed="${CURRENT_VERSION_FROM_DOCKER:-unknown}"
+  target_tag="${FORCE_VERSION:-$(latest_upstream_tag)}"
+
+  if [[ "$installed" != "unknown" ]] && ! version_lt "$installed" "$target_tag" && ! version_lt "$target_tag" "$installed"; then
+    log "Already on ${installed}. Nothing to upgrade — checking the GUAC_AUDIO fix is applied and stopping there."
+    return
+  fi
+
+  if version_lt "$target_tag" "$installed"; then
+    warn "Target version ${target_tag} is OLDER than the currently installed ${installed} — this is a DOWNGRADE."
+    warn "jmsctl.sh takes its own DB backup before migrating, so this is recoverable, but downgrading"
+    warn "a stateful, DB-backed app isn't automatically safe the way upgrading normally is."
+    if [[ "$CONFIRM_DOWNGRADE" != true ]]; then
+      die "Re-run with --confirm-downgrade added to proceed anyway, once you've read the warning above."
+    fi
+    warn "Proceeding with downgrade (--confirm-downgrade was passed)."
+  fi
+
+  local verb="Upgrading"
+  version_lt "$target_tag" "$installed" && verb="Downgrading"
+  log "${verb} JumpServer ${installed} -> ${target_tag} (jumpserver-installer layout)"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] Would download jumpserver-installer-${target_tag}.tar.gz, extract to /opt, run jmsctl.sh upgrade && jmsctl.sh start"
+    return
+  fi
+
+  local tarball="jumpserver-installer-${target_tag}.tar.gz"
+  local download_url="https://github.com/${INSTALLER_REPO}/releases/download/${target_tag}/${tarball}"
+  log "Downloading ${download_url}"
+  ( cd /opt && curl -fsSL -O "$download_url" )
+
+  local new_dir="/opt/jumpserver-installer-${target_tag}"
+  log "Extracting to ${new_dir}"
+  ( cd /opt && tar -zxf "$tarball" )
+  [[ -d "$new_dir" ]] || die "Expected ${new_dir} to exist after extracting ${tarball} but it doesn't — check the tarball's actual top-level directory name."
+
+  log "Running jmsctl.sh upgrade (this includes jmsctl's own DB backup to /data/jumpserver/db_backup/)..."
+  log "NOTE: this may show a (y/n) confirmation prompt — auto-confirming with 'y' for unattended runs."
+  log "Re-run with --interactive if you'd rather answer it yourself."
+  (
+    cd "$new_dir"
+    chmod +x ./jmsctl.sh
+    if [[ "$INTERACTIVE" == true ]]; then
+      ./jmsctl.sh upgrade
+    else
+      printf 'y\n' | ./jmsctl.sh upgrade
+    fi
+  ) || die "jmsctl.sh upgrade failed. Your previous version's directory and data are untouched — check the output above."
+
+  log "Starting services on the new version..."
+  ( cd "$new_dir" && ./jmsctl.sh start ) || die "jmsctl.sh start failed after upgrade — check container status with: docker ps"
+
+  log "Upgrade complete: now on ${target_tag}."
+}
+
+# ---------------------------------------------------------------------------
+# Legacy (older quick_start.sh, single /opt/jumpserver directory) update path
+# — kept for boxes that genuinely still use this layout.
+# ---------------------------------------------------------------------------
+do_update_legacy() {
+  local installed target_tag
+  installed=$(jq -r '.installed_version // empty' "$ACCESSRIG_MARKER" 2>/dev/null || echo "")
+  installed="${installed:-$CURRENT_VERSION_FROM_DOCKER}"
   target_tag="${FORCE_VERSION:-$(latest_upstream_tag)}"
 
   if [[ "$installed" == "$target_tag" ]]; then
@@ -428,11 +666,11 @@ do_update() {
 
   local verb="Upgrading"
   version_lt "$target_tag" "$installed" && verb="Downgrading"
-  log "${verb} JumpServer ${installed} -> ${target_tag}"
+  log "${verb} JumpServer ${installed} -> ${target_tag} (legacy layout)"
 
   local backup_file="${BACKUP_DIR}/pre-upgrade-${installed}-to-${target_tag}-$(date +%s).tar.gz"
   log "Backing up ${ACCESSRIG_HOME} (excluding backups/ itself) to ${backup_file}"
-  tar --exclude="${BACKUP_DIR}" -czf "$backup_file" -C / opt/jumpserver
+  tar --exclude="opt/jumpserver/backups" -czf "$backup_file" -C / opt/jumpserver
 
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] Would run quick_start.sh for ${target_tag} against existing /opt/jumpserver"
