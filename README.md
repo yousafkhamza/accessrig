@@ -14,8 +14,8 @@ The official install tooling (`jmsctl.sh`, from JumpServer's own `installer` rep
 
 ```bash
 curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
-  --domain "jumpserver.Google.ae" \
-  --org-name "Google" \
+  --domain "jumpserver.google.com" \
+  --org-name "google" \
   --s3-bucket "jumpserver-recordings-prod" \
   --s3-region "eu-central-1" \
   --timezone "Asia/Dubai" \

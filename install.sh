@@ -12,8 +12,8 @@
 #
 # Usage (fresh box):
 #   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
-#       --domain "jumpserver.Google.ae" \
-#       --org-name "Google" \
+#       --domain "jumpserver.google.com" \
+#       --org-name "google" \
 #       --s3-bucket "jumpserver-recordings-prod" \
 #       --s3-region "eu-central-1" \
 #       --timezone "Asia/Dubai" \
@@ -178,7 +178,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "install" && "$LIST_VERSIONS" != true && "$SHOW_CURRENT_VERSION" != true ]]; then
   if [[ -z "$DOMAIN" && "$INTERACTIVE" == true ]]; then
-    read -rp "Domain name JumpServer will be reached at (e.g. jumpserver.Google.ae): " DOMAIN
+    read -rp "Domain name JumpServer will be reached at (e.g. jumpserver.google.com): " DOMAIN
   fi
   if [[ -z "$ORG_NAME" && "$INTERACTIVE" == true ]]; then
     read -rp "Organization name (shown on dashboard): " ORG_NAME
