@@ -603,7 +603,7 @@ EOF
   else
     if [[ "$current_http_port" != "$alt_port" ]]; then
       log "Moving jms_web off host port 80: HTTP_PORT ${current_http_port} -> ${alt_port}"
-      sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=${alt_port}/" "$REAL_ENV_FILE"
+      sed -i.accessrig-bak --follow-symlinks "s/^HTTP_PORT=.*/HTTP_PORT=${alt_port}/" "$REAL_ENV_FILE"
     else
       warn "HTTP_PORT in .env already says ${alt_port}, but jms_web is still really on ${real_web_port:-80}"
       warn "(a previous attempt updated the file but never actually recreated the container) —"
@@ -655,7 +655,7 @@ configure_domain() {
 
   log "Setting DOMAINS=${DOMAIN} (fixes CSRF Origin checking for this domain)..."
   if grep -q '^DOMAINS=' "$REAL_ENV_FILE" 2>/dev/null; then
-    sed -i.accessrig-bak "s|^DOMAINS=.*|DOMAINS=${DOMAIN}|" "$REAL_ENV_FILE"
+    sed -i.accessrig-bak --follow-symlinks "s|^DOMAINS=.*|DOMAINS=${DOMAIN}|" "$REAL_ENV_FILE"
   else
     echo "DOMAINS=${DOMAIN}" >> "$REAL_ENV_FILE"
   fi
@@ -678,7 +678,7 @@ configure_locale() {
   if [[ -n "$TIMEZONE" && "$current_tz" != "$TIMEZONE" ]]; then
     log "Setting TIME_ZONE=${TIMEZONE}..."
     if grep -q '^TIME_ZONE=' "$REAL_ENV_FILE" 2>/dev/null; then
-      sed -i.accessrig-bak "s|^TIME_ZONE=.*|TIME_ZONE=${TIMEZONE}|" "$REAL_ENV_FILE"
+      sed -i.accessrig-bak --follow-symlinks "s|^TIME_ZONE=.*|TIME_ZONE=${TIMEZONE}|" "$REAL_ENV_FILE"
     else
       echo "TIME_ZONE=${TIMEZONE}" >> "$REAL_ENV_FILE"
     fi
@@ -688,7 +688,7 @@ configure_locale() {
   if [[ -n "$LANGUAGE_CODE" && "$current_lang" != "$LANGUAGE_CODE" ]]; then
     log "Setting LANGUAGE_CODE=${LANGUAGE_CODE}..."
     if grep -q '^LANGUAGE_CODE=' "$REAL_ENV_FILE" 2>/dev/null; then
-      sed -i.accessrig-bak "s|^LANGUAGE_CODE=.*|LANGUAGE_CODE=${LANGUAGE_CODE}|" "$REAL_ENV_FILE"
+      sed -i.accessrig-bak --follow-symlinks "s|^LANGUAGE_CODE=.*|LANGUAGE_CODE=${LANGUAGE_CODE}|" "$REAL_ENV_FILE"
     else
       echo "LANGUAGE_CODE=${LANGUAGE_CODE}" >> "$REAL_ENV_FILE"
     fi
