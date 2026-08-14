@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AccessRig — one-command JumpServer deploys</title>
+<style>
+  :root { --bg:#0b0f14; --fg:#e6edf3; --muted:#8b98a5; --accent:#5ee0c0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family: -apple-system, "Segoe UI", Roboto, sans-serif; line-height:1.55; }
+  main { max-width: 760px; margin: 0 auto; padding: 64px 24px 96px; }
+  h1 { font-size: 2rem; margin-bottom: 4px; }
+  p.tag { color: var(--muted); margin-top: 0; }
+  pre { background:#11161c; border:1px solid #1f2733; border-radius:8px; padding:16px; overflow-x:auto; }
+  code { color: var(--accent); }
+  .credit { border-left: 3px solid var(--accent); padding-left: 16px; color: var(--muted); margin: 32px 0; }
+  a { color: var(--accent); }
+  table { width:100%; border-collapse: collapse; margin: 24px 0; }
+  td, th { text-align:left; padding: 8px 12px; border-bottom: 1px solid #1f2733; font-size: 0.92rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>AccessRig</h1>
+  <p class="tag">A one-command installer/updater for JumpServer on a fresh EC2 box.<br>By <a href="https://github.com/yousafkhamza" target="_blank">Yousaf Hamza</a></p>
+
+  <div class="credit">
+    JumpServer is built and maintained by <a href="https://fit2cloud.com" target="_blank">Fit2Cloud</a> and the
+    <a href="https://github.com/jumpserver/jumpserver" target="_blank">JumpServer open-source project</a>.
+    AccessRig is an independent deployment wrapper — it does not modify or redistribute JumpServer's code.
+  </div>
+
+  <h2>Install</h2>
+  <pre><code>curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
+  --org-name "Google" \
+  --s3-bucket "jumpserver-recordings-prod" \
+  --s3-region "eu-central-1" \
+  --timezone "Asia/Dubai" \
+  --language "en"</code></pre>
+
+  <h2>Update (safe, in place)</h2>
+  <pre><code>curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash</code></pre>
+  <p>Auto-detects an existing install, backs up <code>/opt/jumpserver</code>, and upgrades in place.</p>
+
+  <h2>Full source</h2>
+  <p>See <a href="https://github.com/yousafkhamza/accessrig">the repository</a> for the full script, README, and IAM policy.</p>
+</main>
+</body>
+</html>
