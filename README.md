@@ -14,7 +14,7 @@ The official quick-start is great but leaves a few things manual every time: Doc
 
 ```bash
 curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
-  --org-name "Google" \
+  --org-name "Pay10" \
   --s3-bucket "jumpserver-recordings-prod" \
   --s3-region "eu-central-1" \
   --timezone "Asia/Dubai" \

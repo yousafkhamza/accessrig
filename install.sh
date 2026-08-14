@@ -12,7 +12,7 @@
 #
 # Usage (fresh box):
 #   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
-#       --org-name "Google" \
+#       --org-name "Pay10" \
 #       --s3-bucket "jumpserver-recordings-prod" \
 #       --s3-region "eu-central-1" \
 #       --timezone "Asia/Dubai" \
@@ -34,6 +34,10 @@ ACCESSRIG_MARKER="${ACCESSRIG_STATE_DIR}/install.json"
 BACKUP_DIR="${ACCESSRIG_HOME}/backups"
 JUMPSERVER_REPO="jumpserver/jumpserver"          # upstream GitHub repo
 QUICKSTART_URL_BASE="https://github.com/jumpserver/jumpserver/releases/latest/download"
+# Where to fetch sibling scripts (branding-proxy.sh) from when this file is run
+# via `curl | bash` — in that mode $0 has no real path, so a local relative
+# lookup won't find them. Override with ACCESSRIG_BASE_URL=... if you fork this.
+ACCESSRIG_BASE_URL="${ACCESSRIG_BASE_URL:-https://yousafkhamza.github.io/accessrig}"
 
 ORG_NAME=""
 S3_BUCKET=""
@@ -220,7 +224,17 @@ EOF
   fi
 
   if [[ "$ENABLE_BRANDING_PROXY" == true && -n "$ORG_NAME" ]]; then
-    bash "$(dirname "$0")/scripts/branding-proxy.sh" "$ORG_NAME"
+    local local_script="$(dirname "$0")/scripts/branding-proxy.sh"
+    if [[ -f "$local_script" ]]; then
+      bash "$local_script" "$ORG_NAME"
+    else
+      # We were run via curl | bash, so $0 has no usable path — fetch the sibling script instead.
+      if curl -fsSL "${ACCESSRIG_BASE_URL}/scripts/branding-proxy.sh" -o /tmp/branding-proxy.sh; then
+        bash /tmp/branding-proxy.sh "$ORG_NAME"
+      else
+        warn "Could not fetch branding-proxy.sh from ${ACCESSRIG_BASE_URL} — skipping cosmetic branding (install itself is unaffected)."
+      fi
+    fi
   fi
 
   log "Install complete. UI: http://$(curl -s ifconfig.me 2>/dev/null || echo '<ec2-ip>')"
