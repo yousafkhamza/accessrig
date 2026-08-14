@@ -150,11 +150,52 @@ sudo ./scripts/lion-audio-fix.sh              # apply
 sudo ./scripts/lion-audio-fix.sh --remove     # remove (e.g. before upgrading JumpServer — see the upgrade runbook above)
 ```
 
-This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified. It requires the same one manual step as the branding proxy (moving `jms_nginx`'s port mapping from `80:80` to `8081:80` in your compose file) for the same reason — that move can't be done safely without knowing your exact compose file layout.
+This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified.
+
+### Compose layout: this auto-detects correctly for BOTH installer types
+
+JumpServer has shipped two different deployment layouts depending on version/installer:
+
+- **Older `quick_start.sh`**: single directory, one compose file — `/opt/jumpserver/compose.yml` (or `docker-compose.yml`).
+- **Newer `jumpserver-installer` tool**: a **versioned** directory (`/opt/jumpserver-installer-v<X.Y.Z>/` — this path *changes on every upgrade*), with the project split across nine separate compose files under `compose/`: `network.yml`, `core.yml`, `celery.yml`, `koko.yml`, `lion.yml`, `chen.yml`, `web.yml`, `redis.yml`, `postgres.yml`.
+
+`lion-audio-fix.sh` doesn't guess which one you're on or assume a fixed path — it asks Docker directly, which always knows exactly which file(s) created each container:
+
+```bash
+docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' jms_core
+```
+
+Whatever that returns (one file or nine, comma-separated), the script detects all of them and passes **every single one** via `-f` on every `docker compose` call it makes — passing only a subset would make Compose think the missing services aren't part of the project anymore, which risks it treating already-running containers as orphaned. This was tested against the real 9-file output format before shipping, not just the simple single-file case.
+
+If auto-detection ever fails, override it explicitly:
+
+```bash
+sudo ./scripts/lion-audio-fix.sh --compose-files "/path/a.yml,/path/b.yml,/path/c.yml"
+```
+
+**Finding the port-80 mapping**: with 9 files instead of 1, the script doesn't guess which file has the port mapping either — it prints a `grep -l` command that finds the exact file for you:
+
+```bash
+grep -l '80:80' /opt/jumpserver-installer-v4.10.15/compose/*.yml
+```
 
 The Lua removal logic and the surrounding nginx config were both verified independently before shipping this: the query-string logic was tested against the literal request URL captured from a real browser DevTools session, confirming both `GUAC_AUDIO` values are removed while every other parameter (including `TOKEN_ID`) survives; the nginx config was validated with `nginx -t` down to a clean pass.
 
-If you also ran `branding-proxy.sh` earlier, remove it first — you don't want two proxies both trying to bind port 80. `lion-audio-fix.sh` prints the exact teardown command for that at the end of its output.
+If you also ran `branding-proxy.sh` earlier, remove it first — you don't want two proxies both trying to bind port 80.
+
+### ⚠️ Worth checking if you're on the jumpserver-installer layout
+
+`install.sh`/`uninstall.sh` in this repo still assume the older `/opt/jumpserver` single-directory layout for backups and data (`ACCESSRIG_HOME="/opt/jumpserver"`). If your box uses the versioned `jumpserver-installer` layout instead (check with the `docker inspect` command above), **the backup step in `install.sh`'s update flow may have been backing up the wrong directory** — worth confirming before you trust it for anything important:
+
+```bash
+# Compare what's actually in each — if /opt/jumpserver is nearly empty while
+# the real data (postgres volumes, config, recordings) is under the versioned
+# installer directory, the backup path needs fixing before your next upgrade.
+ls -la /opt/jumpserver 2>/dev/null
+ls -la /opt/jumpserver-installer-v*/  2>/dev/null
+```
+
+I haven't fixed this in `install.sh`/`uninstall.sh` yet — flagging it here rather than silently leaving a gap, since it affects the "zero data loss" guarantee those scripts claim. If your box turns out to be on this layout, say so and I'll rework the backup/data-path detection to match the same Docker-label approach used here.
 
 ## Enabling GitHub Pages on your fork
 

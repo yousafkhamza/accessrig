@@ -18,17 +18,23 @@
 # unrelated tool. This one only touches query args on one specific path and
 # leaves everything else (headers, body, all other routes) completely alone.
 #
+# COMPOSE LAYOUT: the official "jumpserver-installer" tool deploys to a
+# VERSIONED directory (/opt/jumpserver-installer-v<X.Y.Z>/ — this changes on
+# every upgrade) with the project split across multiple compose files under
+# compose/ (network.yml, core.yml, celery.yml, koko.yml, lion.yml, chen.yml,
+# web.yml, redis.yml, postgres.yml). This script detects and passes ALL of
+# them via multiple -f flags on every invocation — passing only one would
+# make Compose think the other services aren't part of the project anymore.
+#
 # Usage:
-#   sudo ./lion-audio-fix.sh                          # install/apply the fix
-#   sudo ./lion-audio-fix.sh --remove                 # stop and remove the sidecar (e.g. before upgrading JumpServer)
-#   sudo ./lion-audio-fix.sh --compose-file /path/to/compose.yml   # override auto-detection
+#   sudo ./lion-audio-fix.sh                                  # install/apply the fix
+#   sudo ./lion-audio-fix.sh --remove                         # stop and remove the sidecar (e.g. before upgrading)
+#   sudo ./lion-audio-fix.sh --compose-files "/path/a.yml,/path/b.yml"   # override auto-detection
 #
 set -euo pipefail
 
-JMS_DIR="/opt/jumpserver"
-FIX_DIR="${JMS_DIR}/.accessrig/lion-audio-fix"
 MODE="apply"
-COMPOSE_FILE_OVERRIDE=""
+COMPOSE_FILES_OVERRIDE=""
 
 log()  { echo -e "\033[1;36m[lion-audio-fix]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[lion-audio-fix][warn]\033[0m $*"; }
@@ -37,47 +43,72 @@ die()  { echo -e "\033[1;31m[lion-audio-fix][error]\033[0m $*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --remove) MODE="remove"; shift ;;
-    --compose-file) COMPOSE_FILE_OVERRIDE="$2"; shift 2 ;;
+    --compose-files) COMPOSE_FILES_OVERRIDE="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 
 [[ $EUID -eq 0 ]] || die "Run this as root or with sudo."
 
-# Docker itself always knows exactly which compose file(s) it used to bring
-# up a project — reading that label is far more reliable than guessing
-# filenames, since quick_start.sh's exact layout has varied across versions.
-detect_compose_file() {
-  if [[ -n "$COMPOSE_FILE_OVERRIDE" ]]; then
-    echo "$COMPOSE_FILE_OVERRIDE"
+# ---------------------------------------------------------------------------
+# Detect every compose file the running project actually uses, straight from
+# Docker's own compose label — comma-separated, could be one file or several.
+# ---------------------------------------------------------------------------
+detect_compose_files() {
+  if [[ -n "$COMPOSE_FILES_OVERRIDE" ]]; then
+    echo "$COMPOSE_FILES_OVERRIDE" | tr ',' '\n'
     return
   fi
 
   local label_files=""
-  for probe_container in jms_core jms_nginx jms_lion; do
+  for probe_container in jms_core jms_nginx jms_lion jms_web; do
     label_files="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$probe_container" 2>/dev/null || true)"
     [[ -n "$label_files" && "$label_files" != "<no value>" ]] && break
   done
 
   if [[ -n "$label_files" && "$label_files" != "<no value>" ]]; then
-    # Can be a comma-separated list if multiple -f files were used at deploy time.
-    echo "$label_files" | tr ',' '\n' | head -n1
+    echo "$label_files" | tr ',' '\n'
     return
   fi
 
-  # Fallback: the filenames quick_start.sh has used across versions.
-  for candidate in "${JMS_DIR}/compose.yml" "${JMS_DIR}/docker-compose.yml" "${JMS_DIR}/compose.yaml" "${JMS_DIR}/docker-compose.yaml"; do
+  # Fallback for the older single-file quick_start.sh layout.
+  for candidate in "/opt/jumpserver/compose.yml" "/opt/jumpserver/docker-compose.yml" \
+                   "/opt/jumpserver/compose.yaml" "/opt/jumpserver/docker-compose.yaml"; do
     [[ -f "$candidate" ]] && { echo "$candidate"; return; }
   done
 }
 
-COMPOSE_FILE="$(detect_compose_file)"
-if [[ -z "$COMPOSE_FILE" || ! -f "$COMPOSE_FILE" ]]; then
-  die "Could not auto-detect the compose file. Find it yourself with:
+mapfile -t COMPOSE_FILES < <(detect_compose_files)
+
+if [[ ${#COMPOSE_FILES[@]} -eq 0 || -z "${COMPOSE_FILES[0]}" ]]; then
+  die "Could not auto-detect any compose files. Find them yourself with:
     docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project.config_files\" }}' jms_core
-  then re-run with: sudo ./lion-audio-fix.sh --compose-file /the/actual/path.yml"
+  then re-run with:
+    sudo ./lion-audio-fix.sh --compose-files \"/path/a.yml,/path/b.yml,...\""
 fi
-log "Using compose file: ${COMPOSE_FILE}"
+
+for f in "${COMPOSE_FILES[@]}"; do
+  [[ -f "$f" ]] || die "Detected compose file does not exist on disk: $f"
+done
+
+log "Using ${#COMPOSE_FILES[@]} compose file(s):"
+for f in "${COMPOSE_FILES[@]}"; do log "  - $f"; done
+
+# The installer directory is the parent of compose/ — e.g. the first file is
+# .../jumpserver-installer-v4.10.15/compose/network.yml, so going up two
+# levels gets the versioned installer root. This directory CHANGES on every
+# upgrade, so it's re-detected fresh every time this script runs rather than
+# assumed or cached anywhere.
+INSTALLER_DIR="$(dirname "$(dirname "${COMPOSE_FILES[0]}")")"
+FIX_DIR="${INSTALLER_DIR}/.accessrig/lion-audio-fix"
+log "Installer directory: ${INSTALLER_DIR}"
+
+# Build the repeated "-f file1 -f file2 ..." argument list once, used by
+# every docker compose invocation below.
+COMPOSE_ARGS=()
+for f in "${COMPOSE_FILES[@]}"; do
+  COMPOSE_ARGS+=(-f "$f")
+done
 
 if [[ "$MODE" == "remove" ]]; then
   if [[ ! -f "${FIX_DIR}/docker-compose.override.yml" ]]; then
@@ -85,14 +116,19 @@ if [[ "$MODE" == "remove" ]]; then
     exit 0
   fi
   log "Stopping and removing the accessrig-lion-audio-fix sidecar..."
-  docker compose -f "$COMPOSE_FILE" -f "${FIX_DIR}/docker-compose.override.yml" stop accessrig-lion-audio-fix || true
-  docker compose -f "$COMPOSE_FILE" -f "${FIX_DIR}/docker-compose.override.yml" rm -f accessrig-lion-audio-fix || true
+  docker compose "${COMPOSE_ARGS[@]}" -f "${FIX_DIR}/docker-compose.override.yml" stop accessrig-lion-audio-fix || true
+  docker compose "${COMPOSE_ARGS[@]}" -f "${FIX_DIR}/docker-compose.override.yml" rm -f accessrig-lion-audio-fix || true
   echo ""
-  warn "MANUAL STEP: revert jms_nginx's port mapping in ${COMPOSE_FILE} back from"
-  warn "8081:80 to 80:80 (the exact opposite of the change you made when applying"
-  warn "this fix), then bring it back up WITHOUT the override file:"
+  warn "MANUAL STEP: find and revert the port-80 mapping you changed when applying"
+  warn "this fix (it was moved from 80:80 to 8081:80 in one of the files below —"
+  warn "find exactly which one, rather than guess, with:"
   echo ""
-  echo "  docker compose -f ${COMPOSE_FILE} up -d"
+  echo "  grep -l '8081:80' ${INSTALLER_DIR}/compose/*.yml"
+  echo ""
+  warn "change that 8081:80 back to 80:80, then bring everything back up WITHOUT"
+  warn "the override file:"
+  echo ""
+  echo "  docker compose ${COMPOSE_ARGS[*]} up -d"
   echo ""
   log "Port 80 is free once that's done — safe to run an upgrade now."
   exit 0
@@ -145,8 +181,8 @@ server {
 NGINXEOF
 
 cat > "${FIX_DIR}/docker-compose.override.yml" <<EOF
-# Merge this into your main compose invocation:
-#   docker compose -f ${COMPOSE_FILE} -f ${FIX_DIR}/docker-compose.override.yml up -d
+# Merge this into your main compose invocation (ALL of the original -f files
+# are required, not just one — see the command printed below):
 services:
   accessrig-lion-audio-fix:
     image: openresty/openresty:alpine
@@ -161,14 +197,15 @@ EOF
 
 log "Wrote ${FIX_DIR}/nginx.conf and docker-compose.override.yml"
 echo ""
-warn "MANUAL STEP (same as always with a fronting proxy — this can't be safely"
-warn "automated without risking your existing port mappings): in ${COMPOSE_FILE},"
-warn "change jms_nginx's port mapping from 80:80 to 8081:80, then run:"
+warn "MANUAL STEP (can't be automated safely without risking your existing port"
+warn "mappings): find which compose file maps port 80 for the web/nginx"
+warn "container, and change it from 80:80 to 8081:80:"
 echo ""
-echo "  docker compose -f ${COMPOSE_FILE} -f ${FIX_DIR}/docker-compose.override.yml up -d"
+echo "  grep -l '80:80' ${INSTALLER_DIR}/compose/*.yml"
+echo ""
+warn "Edit that file, then bring everything up together — note this needs ALL"
+warn "of the original compose files plus the override, every time:"
+echo ""
+echo "  docker compose ${COMPOSE_ARGS[*]} -f ${FIX_DIR}/docker-compose.override.yml up -d"
 echo ""
 log "After that, retry the RDP connection that was showing a black screen."
-log "If you also have the branding-proxy running from earlier, remove it first —"
-log "you don't want two proxies both trying to bind port 80:"
-echo "  docker compose -f ${COMPOSE_FILE} -f ${JMS_DIR}/.accessrig/branding-proxy/docker-compose.override.yml stop accessrig-branding-proxy"
-echo "  docker compose -f ${COMPOSE_FILE} -f ${JMS_DIR}/.accessrig/branding-proxy/docker-compose.override.yml rm -f accessrig-branding-proxy"
