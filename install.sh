@@ -166,7 +166,11 @@ detect_os
 # Step 0 — decide install vs update BEFORE asking anything
 # ---------------------------------------------------------------------------
 MODE="install"
-if [[ -f "$ACCESSRIG_MARKER" ]] || docker inspect jms_core >/dev/null 2>&1; then
+if docker inspect jms_core >/dev/null 2>&1; then
+  MODE="update"
+elif [[ -f "${ACCESSRIG_HOME}/compose.yml" || -f "${ACCESSRIG_HOME}/docker-compose.yml" ]]; then
+  # Legacy quick_start.sh layout: no running container yet is still possible
+  # right after a stop, but a real compose file on disk is real evidence.
   MODE="update"
 fi
 if [[ "$LIST_VERSIONS" != true && "$SHOW_CURRENT_VERSION" != true ]]; then
