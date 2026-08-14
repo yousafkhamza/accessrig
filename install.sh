@@ -344,6 +344,7 @@ LAYOUT=""
 REAL_INSTALLER_DIR=""
 REAL_ENV_FILE=""
 REAL_COMPOSE_ARGS=()
+COMPOSE_FILES=()
 CURRENT_VERSION_FROM_DOCKER=""
 
 detect_real_layout() {
@@ -351,6 +352,7 @@ detect_real_layout() {
   REAL_INSTALLER_DIR=""
   REAL_ENV_FILE=""
   REAL_COMPOSE_ARGS=()
+  COMPOSE_FILES=()
 
   local label_files=""
   for probe_container in jms_core jms_web jms_lion; do
@@ -369,6 +371,7 @@ detect_real_layout() {
       REAL_ENV_FILE="${REAL_INSTALLER_DIR}/.env"
       if [[ -f "$REAL_ENV_FILE" ]]; then
         LAYOUT="jumpserver-installer"
+        COMPOSE_FILES=("${_compose_files[@]}")
         REAL_COMPOSE_ARGS=(--env-file "$REAL_ENV_FILE")
         for f in "${_compose_files[@]}"; do
           REAL_COMPOSE_ARGS+=(-f "$f")
@@ -465,17 +468,58 @@ EOF
   current_http_port="${current_http_port:-80}"
   local alt_port=18080
 
-  if [[ "$current_http_port" == "$alt_port" ]]; then
-    warn "HTTP_PORT is already ${alt_port} — assuming the fix's port move already happened, just starting the sidecar."
+  # Pick up any OTHER env-like files in the installer directory too — some
+  # jumpserver-installer deployments split variables across a second file
+  # (commonly named static.env) beyond just .env. docker compose accepts
+  # multiple --env-file flags and merges them, so include whatever's there
+  # rather than assume .env is the only one — this is also what was causing
+  # the "CONFIG_DIR/VERSION/CONFIG_SAFE_FILE not set" warnings.
+  local compose_args=()
+  local ef
+  for ef in "${REAL_INSTALLER_DIR}/.env" "${REAL_INSTALLER_DIR}"/*.env; do
+    [[ -f "$ef" ]] && compose_args+=(--env-file "$ef")
+  done
+  for f in "${COMPOSE_FILES[@]}"; do
+    compose_args+=(-f "$f")
+  done
+
+  # Don't trust .env's declared port — check what jms_web is ACTUALLY bound
+  # to right now. A stale/interrupted earlier attempt can leave .env saying
+  # one thing while the running container still says another.
+  local real_web_port
+  real_web_port="$(docker port jms_web 80/tcp 2>/dev/null | head -n1 | awk -F: '{print $NF}')"
+
+  if [[ "$real_web_port" == "$alt_port" ]]; then
+    log "jms_web is genuinely already running on ${alt_port} — nothing to recreate."
   else
-    log "Moving jms_web off host port 80: HTTP_PORT ${current_http_port} -> ${alt_port}"
-    sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=${alt_port}/" "$REAL_ENV_FILE"
-    log "Recreating whatever changed (should just be the web service)..."
-    docker compose "${REAL_COMPOSE_ARGS[@]}" up -d
+    if [[ "$current_http_port" != "$alt_port" ]]; then
+      log "Moving jms_web off host port 80: HTTP_PORT ${current_http_port} -> ${alt_port}"
+      sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=${alt_port}/" "$REAL_ENV_FILE"
+    else
+      warn "HTTP_PORT in .env already says ${alt_port}, but jms_web is still really on ${real_web_port:-80}"
+      warn "(a previous attempt updated the file but never actually recreated the container) —"
+      warn "recreating it now to match."
+    fi
+
+    # Target the actual web service specifically rather than every service,
+    # to minimize what gets touched — discovered by name pattern rather than
+    # assumed, since the container name (jms_web) isn't necessarily the same
+    # as the compose service key underneath.
+    local web_service
+    web_service="$(docker compose "${compose_args[@]}" config --services 2>/dev/null | grep -i 'web' | head -n1)"
+    if [[ -z "$web_service" ]]; then
+      warn "Could not discover the web service name from compose config — recreating everything"
+      warn "instead of just the web service. Compose only recreates what actually changed, so"
+      warn "already-healthy containers should be left alone regardless."
+      docker compose "${compose_args[@]}" up -d
+    else
+      log "Recreating '${web_service}' service on its new port..."
+      docker compose "${compose_args[@]}" up -d "$web_service"
+    fi
   fi
 
   log "Starting the audio-fix sidecar on port 80..."
-  docker compose "${REAL_COMPOSE_ARGS[@]}" -f "${fix_dir}/docker-compose.override.yml" up -d accessrig-lion-audio-fix
+  docker compose "${compose_args[@]}" -f "${fix_dir}/docker-compose.override.yml" up -d accessrig-lion-audio-fix
 
   log "GUAC_AUDIO fix applied. RDP connections should no longer black-screen."
 }
