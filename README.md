@@ -146,42 +146,51 @@ If RDP connections through JumpServer show a black screen and Lion's logs contai
 This is a known upstream bug (matches [jumpserver/jumpserver#13156](https://github.com/jumpserver/jumpserver/issues/13156) and [#13799](https://github.com/jumpserver/jumpserver/issues/13799)) — Luna's client-side JS always appends `GUAC_AUDIO=audio/L8&GUAC_AUDIO=audio/L16` to every RDP connect request, and Lion's protocol parser chokes on it. There's no platform-level toggle for this; it isn't configurable from the JumpServer UI.
 
 ```bash
-sudo ./scripts/lion-audio-fix.sh              # apply
-sudo ./scripts/lion-audio-fix.sh --remove     # remove (e.g. before upgrading JumpServer — see the upgrade runbook above)
+sudo ./scripts/lion-audio-fix.sh                    # apply (fully automated, no manual steps)
+sudo ./scripts/lion-audio-fix.sh --remove           # remove (e.g. before upgrading JumpServer)
+sudo ./scripts/lion-audio-fix.sh --alt-port 18080   # customize the port jms_web moves to (default 18080)
 ```
 
 This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified.
 
-### Compose layout: this auto-detects correctly for BOTH installer types
+### Real container layout (confirmed against a live jumpserver-installer deployment)
 
-JumpServer has shipped two different deployment layouts depending on version/installer:
+Earlier versions of this script assumed a container named `jms_nginx` — that container doesn't exist on the `jumpserver-installer` layout. Confirmed via `docker ps` against a real box:
 
-- **Older `quick_start.sh`**: single directory, one compose file — `/opt/jumpserver/compose.yml` (or `docker-compose.yml`).
-- **Newer `jumpserver-installer` tool**: a **versioned** directory (`/opt/jumpserver-installer-v<X.Y.Z>/` — this path *changes on every upgrade*), with the project split across nine separate compose files under `compose/`: `network.yml`, `core.yml`, `celery.yml`, `koko.yml`, `lion.yml`, `chen.yml`, `web.yml`, `redis.yml`, `postgres.yml`.
+| Container | Role |
+|---|---|
+| `jms_web` | The actual reverse proxy, published on the host at `HTTP_PORT` (default 80). This is what the sidecar needs to take over port 80 from. |
+| `jms_lion` | Exposes port `8081` on the internal Docker network only (not published to the host) — this is Lion's own embedded server, and the actual target for the GUAC_AUDIO strip. |
 
-`lion-audio-fix.sh` doesn't guess which one you're on or assume a fixed path — it asks Docker directly, which always knows exactly which file(s) created each container:
+The fix proxies `/lion/ws/connect/` directly to `jms_lion:8081` (after stripping `GUAC_AUDIO`), and everything else to `jms_web:80` — its container-internal port, which stays 80 regardless of whatever the host-side `HTTP_PORT` is remapped to.
+
+### Port handling is fully automated via `.env`, not raw compose editing
+
+The `jumpserver-installer` layout's `.env` file has an `HTTP_PORT` variable specifically for this situation — its own comment says *"if it conflicts with the existing service, please modify it yourself"*. Since this is a single well-defined `KEY=VALUE` line rather than arbitrary YAML structure, `lion-audio-fix.sh` edits it directly and safely:
+
+```bash
+sed -i.accessrig-bak "s/^HTTP_PORT=.*/HTTP_PORT=${ALT_PORT}/" "$ENV_FILE"
+```
+
+A backup of the original `.env` is written alongside it (`.env.accessrig-bak`) before any edit. `--remove` reverts the value back to `80` and recreates `jms_web` on it. No manual file editing is required for either apply or remove — this was tested end-to-end (apply, verify the diff, then remove, verify it reverts byte-for-byte apart from the one line) before shipping.
+
+### Compose layout: multi-file, versioned directory
+
+The `jumpserver-installer` tool deploys to a **versioned** directory (`/opt/jumpserver-installer-v<X.Y.Z>/` — this path *changes on every upgrade*), with the project split across nine separate compose files under `compose/`: `network.yml`, `core.yml`, `celery.yml`, `koko.yml`, `lion.yml`, `chen.yml`, `web.yml`, `redis.yml`, `postgres.yml`. `lion-audio-fix.sh` doesn't guess or assume a fixed path — it asks Docker directly:
 
 ```bash
 docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' jms_core
 ```
 
-Whatever that returns (one file or nine, comma-separated), the script detects all of them and passes **every single one** via `-f` on every `docker compose` call it makes — passing only a subset would make Compose think the missing services aren't part of the project anymore, which risks it treating already-running containers as orphaned. This was tested against the real 9-file output format before shipping, not just the simple single-file case.
+Whatever that returns, the script detects all of them and passes **every single one** via `-f` on every `docker compose` call — passing only a subset would make Compose think the missing services left the project, which risks it treating already-running containers as orphaned. Tested against the real 9-file output format, not just a simplified single-file case.
 
-If auto-detection ever fails, override it explicitly:
+If auto-detection ever fails:
 
 ```bash
 sudo ./scripts/lion-audio-fix.sh --compose-files "/path/a.yml,/path/b.yml,/path/c.yml"
 ```
 
-**Finding the port-80 mapping**: with 9 files instead of 1, the script doesn't guess which file has the port mapping either — it prints a `grep -l` command that finds the exact file for you:
-
-```bash
-grep -l '80:80' /opt/jumpserver-installer-v4.10.15/compose/*.yml
-```
-
-The Lua removal logic and the surrounding nginx config were both verified independently before shipping this: the query-string logic was tested against the literal request URL captured from a real browser DevTools session, confirming both `GUAC_AUDIO` values are removed while every other parameter (including `TOKEN_ID`) survives; the nginx config was validated with `nginx -t` down to a clean pass.
-
-If you also ran `branding-proxy.sh` earlier, remove it first — you don't want two proxies both trying to bind port 80.
+If you also ran `branding-proxy.sh` earlier, remove it first — you don't want two proxies both trying to bind port 80. Note: `branding-proxy.sh` still has the old `jms_nginx` assumption baked in and hasn't been corrected the same way — treat it as unverified against the `jumpserver-installer` layout until it has been.
 
 ### ⚠️ Worth checking if you're on the jumpserver-installer layout
 
