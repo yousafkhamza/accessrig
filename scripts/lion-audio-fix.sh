@@ -19,22 +19,45 @@
 # leaves everything else (headers, body, all other routes) completely alone.
 #
 # Usage:
-#   sudo ./lion-audio-fix.sh
+#   sudo ./lion-audio-fix.sh              # install/apply the fix
+#   sudo ./lion-audio-fix.sh --remove     # stop and remove the sidecar (e.g. before upgrading JumpServer)
 #
 set -euo pipefail
 
 JMS_DIR="/opt/jumpserver"
 FIX_DIR="${JMS_DIR}/.accessrig/lion-audio-fix"
+MODE="apply"
 
 log()  { echo -e "\033[1;36m[lion-audio-fix]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[lion-audio-fix][warn]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[lion-audio-fix][error]\033[0m $*" >&2; exit 1; }
+
+[[ "${1:-}" == "--remove" ]] && MODE="remove"
 
 [[ $EUID -eq 0 ]] || die "Run this as root or with sudo."
 
 COMPOSE_FILE="${JMS_DIR}/compose.yml"
 [[ -f "$COMPOSE_FILE" ]] || COMPOSE_FILE="${JMS_DIR}/docker-compose.yml"
 [[ -f "$COMPOSE_FILE" ]] || die "Could not find compose.yml/docker-compose.yml under ${JMS_DIR}. Check the path and re-run manually."
+
+if [[ "$MODE" == "remove" ]]; then
+  if [[ ! -f "${FIX_DIR}/docker-compose.override.yml" ]]; then
+    log "Nothing to remove — ${FIX_DIR}/docker-compose.override.yml doesn't exist. Fix was never applied on this box."
+    exit 0
+  fi
+  log "Stopping and removing the accessrig-lion-audio-fix sidecar..."
+  docker compose -f "$COMPOSE_FILE" -f "${FIX_DIR}/docker-compose.override.yml" stop accessrig-lion-audio-fix || true
+  docker compose -f "$COMPOSE_FILE" -f "${FIX_DIR}/docker-compose.override.yml" rm -f accessrig-lion-audio-fix || true
+  echo ""
+  warn "MANUAL STEP: revert jms_nginx's port mapping in ${COMPOSE_FILE} back from"
+  warn "8081:80 to 80:80 (the exact opposite of the change you made when applying"
+  warn "this fix), then bring it back up WITHOUT the override file:"
+  echo ""
+  echo "  docker compose -f ${COMPOSE_FILE} up -d"
+  echo ""
+  log "Port 80 is free once that's done — safe to run an upgrade now."
+  exit 0
+fi
 
 mkdir -p "$FIX_DIR"
 

@@ -44,6 +44,7 @@ jobs:
           cp uninstall.sh _site/uninstall.sh
           mkdir -p _site/scripts
           cp scripts/branding-proxy.sh _site/scripts/branding-proxy.sh
+          cp scripts/lion-audio-fix.sh _site/scripts/lion-audio-fix.sh
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

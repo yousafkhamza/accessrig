@@ -31,6 +31,36 @@ curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash
 
 What "zero data loss" actually means here: JumpServer's MySQL/Redis data and your config live under `/opt/jumpserver`, which is a bind mount on the host, not inside a container. Upgrading only replaces container images — it never deletes that directory. AccessRig additionally tars the whole directory to `/opt/jumpserver/backups/` before every upgrade attempt, so a failed upgrade has a one-command rollback path.
 
+### Full upgrade runbook (v4.10.17 → latest, accounting for lion-audio-fix)
+
+If you've applied `lion-audio-fix.sh`, remove it **before** upgrading — it changed `jms_nginx`'s port mapping, and you don't want a stale sidecar fighting the upgrade for port 80:
+
+```bash
+# 1. Check what's currently installed and what's newer
+curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --list-versions
+
+# 1b. Check whether lion-audio-fix is currently applied on this box
+docker ps --filter name=accessrig-lion-audio-fix --format '{{.Names}}: {{.Status}}'
+# empty output = not applied, skip straight to step 3
+
+# 2. If step 1b showed it running, remove it first
+#    (run it from wherever you keep your AccessRig checkout on this server)
+sudo ./scripts/lion-audio-fix.sh --remove
+
+# 3. Do the actual upgrade — no version pin needed to just take the latest
+curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash
+
+# 4. Test the RDP connection that was showing a black screen.
+#    v4.10.18 may or may not have fixed the underlying Lion bug — there's no
+#    changelog line confirming it either way, so this is a real test, not
+#    a formality.
+
+# 5. Only if it's STILL black-screening after the upgrade, reapply the fix:
+sudo ./lion-audio-fix.sh
+```
+
+This order matters: skipping step 2 means the port-80 sidecar container is still bound when `quick_start.sh` (called internally by the upgrade) tries to bring `jms_nginx` back up on its normal port — that's a conflict you'd rather avoid than debug.
+
 ## Choosing a specific version instead of always "latest"
 
 ```bash
@@ -116,7 +146,8 @@ If RDP connections through JumpServer show a black screen and Lion's logs contai
 This is a known upstream bug (matches [jumpserver/jumpserver#13156](https://github.com/jumpserver/jumpserver/issues/13156) and [#13799](https://github.com/jumpserver/jumpserver/issues/13799)) — Luna's client-side JS always appends `GUAC_AUDIO=audio/L8&GUAC_AUDIO=audio/L16` to every RDP connect request, and Lion's protocol parser chokes on it. There's no platform-level toggle for this; it isn't configurable from the JumpServer UI.
 
 ```bash
-sudo ./scripts/lion-audio-fix.sh
+sudo ./scripts/lion-audio-fix.sh              # apply
+sudo ./scripts/lion-audio-fix.sh --remove     # remove (e.g. before upgrading JumpServer — see the upgrade runbook above)
 ```
 
 This is a separate, single-purpose script from `branding-proxy.sh` — it strips only `GUAC_AUDIO` from requests to `/lion/ws/connect/` using an OpenResty (nginx + Lua) sidecar, and passes every other path through completely unmodified. It requires the same one manual step as the branding proxy (moving `jms_nginx`'s port mapping from `80:80` to `8081:80` in your compose file) for the same reason — that move can't be done safely without knowing your exact compose file layout.
