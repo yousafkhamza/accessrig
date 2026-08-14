@@ -401,9 +401,14 @@ apply_lion_audio_fix() {
   [[ "$LAYOUT" == "jumpserver-installer" ]] || return 0
 
   local fix_dir="${REAL_INSTALLER_DIR}/.accessrig/lion-audio-fix"
-  if [[ -f "${fix_dir}/docker-compose.override.yml" ]]; then
-    log "GUAC_AUDIO fix already applied for this installer directory — nothing to do."
+  if [[ -f "${fix_dir}/docker-compose.override.yml" ]] && docker ps --format '{{.Names}}' | grep -qx "accessrig-lion-audio-fix"; then
+    log "GUAC_AUDIO fix sidecar is already running for this installer directory — nothing to do."
     return 0
+  fi
+  if [[ -f "${fix_dir}/docker-compose.override.yml" ]]; then
+    warn "Found a fix config file here already, but the sidecar isn't actually running"
+    warn "(likely left over from an earlier attempt, e.g. carried across by jmsctl.sh's"
+    warn "upgrade migration) — reapplying properly rather than trusting the stale file."
   fi
 
   log "Applying the GUAC_AUDIO / RDP black-screen fix (audio strip proxy)..."
