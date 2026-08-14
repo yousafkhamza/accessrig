@@ -501,6 +501,14 @@ map $http_x_forwarded_proto $accessrig_forwarded_proto {
 
 server {
     listen 80;
+    # Required because the location below uses variables in proxy_pass
+    # ($uri?$args, needed to strip GUAC_AUDIO) — that forces nginx into
+    # runtime DNS resolution instead of resolving once at config load, and
+    # runtime resolution needs an explicit resolver. 127.0.0.11 is Docker's
+    # own embedded DNS server, always present on any container network.
+    # Confirmed as the exact cause of "502 / no resolver defined to resolve
+    # jms_lion" against a live box.
+    resolver 127.0.0.11 valid=30s;
     location /lion/ws/connect/ {
         rewrite_by_lua_block {
             local args = ngx.req.get_uri_args()
