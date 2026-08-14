@@ -166,6 +166,16 @@ mkdir -p "$FIX_DIR"
 # matter what HTTP_PORT the host side is remapped to.
 # ---------------------------------------------------------------------------
 cat > "${FIX_DIR}/nginx.conf" <<'NGINXEOF'
+# Preserve whatever X-Forwarded-Proto the real front door (load balancer /
+# TLS terminator) already set, rather than overwriting it with $scheme —
+# this sidecar only ever sees plain HTTP internally, so $scheme here is
+# always "http" even when the original request was HTTPS. Overwriting it
+# unconditionally breaks Django's CSRF Origin check.
+map $http_x_forwarded_proto $accessrig_forwarded_proto {
+    default $http_x_forwarded_proto;
+    ''      $scheme;
+}
+
 server {
     listen 80;
 
@@ -182,7 +192,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $accessrig_forwarded_proto;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
@@ -195,7 +205,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $accessrig_forwarded_proto;
     }
 }
 NGINXEOF

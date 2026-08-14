@@ -12,11 +12,24 @@
 #
 # Usage (fresh box):
 #   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
+#       --domain "jumpserver.Google.ae" \
 #       --org-name "Google" \
 #       --s3-bucket "jumpserver-recordings-prod" \
 #       --s3-region "eu-central-1" \
 #       --timezone "Asia/Dubai" \
 #       --language "en"
+#
+# --domain matters more than it looks: it sets DOMAINS in JumpServer's shared
+# config, which is what Django's CSRF Origin check trusts. Skip it and you
+# will very likely hit "CSRF Failed: Origin checking failed" the first time
+# you access JumpServer over HTTPS through a real domain — this happened for
+# real and is why this flag exists.
+#
+# The GUAC_AUDIO / RDP-black-screen fix is OFF by default, including on a
+# fresh install — it adds a sidecar container and moves jms_web's port,
+# which isn't something a clean setup should carry unless you actually hit
+# the bug. Add --apply-audio-fix if/when RDP sessions show a black screen:
+#   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --apply-audio-fix
 #
 # Re-running the exact same command on a box that already has AccessRig/JumpServer
 # installed switches automatically into UPDATE mode: it checks the running version
@@ -28,6 +41,9 @@
 #                             any, is currently installed on this box), then exit.
 #   --version <tag>           Pin install/update to a specific tag instead of
 #                             always grabbing "latest" (e.g. --version v4.10.17).
+#                             Also works as a "force upgrade/reinstall" to the
+#                             SAME version you're already on — useful to re-run
+#                             jmsctl.sh against an existing install.
 #   --confirm-downgrade       Required in addition to --version when the target
 #                             tag is OLDER than what's currently installed — a
 #                             backup is still taken either way, but downgrading
@@ -52,6 +68,7 @@ QUICKSTART_URL_BASE="https://github.com/jumpserver/jumpserver/releases/latest/do
 ACCESSRIG_BASE_URL="${ACCESSRIG_BASE_URL:-https://yousafkhamza.github.io/accessrig}"
 
 ORG_NAME=""
+DOMAIN=""
 S3_BUCKET=""
 S3_REGION=""
 TIMEZONE="Asia/Dubai"
@@ -59,8 +76,10 @@ LANGUAGE_CODE="en"
 INTERACTIVE=false
 FORCE_VERSION=""     # pin to a specific tag instead of "latest"
 LIST_VERSIONS=false
+SHOW_CURRENT_VERSION=false
 CONFIRM_DOWNGRADE=false
 ENABLE_BRANDING_PROXY=false   # opt-in — cosmetic only, most setups don't need it
+ENABLE_AUDIO_FIX=false        # opt-in — extra sidecar/port-move, only needed if you actually hit the RDP black-screen bug
 DRY_RUN=false
 
 log()  { echo -e "\033[1;36m[accessrig]\033[0m $*"; }
@@ -120,15 +139,18 @@ pkg_install() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --org-name)     ORG_NAME="$2"; shift 2 ;;
+    --domain)       DOMAIN="$2"; shift 2 ;;
     --s3-bucket)    S3_BUCKET="$2"; shift 2 ;;
     --s3-region)    S3_REGION="$2"; shift 2 ;;
     --timezone)     TIMEZONE="$2"; shift 2 ;;
     --language)     LANGUAGE_CODE="$2"; shift 2 ;;
     --version)      FORCE_VERSION="$2"; shift 2 ;;
     --list-versions) LIST_VERSIONS=true; shift ;;
+    --current-version) SHOW_CURRENT_VERSION=true; shift ;;
     --confirm-downgrade) CONFIRM_DOWNGRADE=true; shift ;;
     --enable-branding-proxy) ENABLE_BRANDING_PROXY=true; shift ;;
     --no-branding-proxy) ENABLE_BRANDING_PROXY=false; shift ;;
+    --apply-audio-fix) ENABLE_AUDIO_FIX=true; shift ;;
     --interactive)  INTERACTIVE=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
     -h|--help)
@@ -144,15 +166,20 @@ detect_os
 # Step 0 — decide install vs update BEFORE asking anything
 # ---------------------------------------------------------------------------
 MODE="install"
-if [[ -f "$ACCESSRIG_MARKER" ]]; then
+if [[ -f "$ACCESSRIG_MARKER" ]] || docker inspect jms_core >/dev/null 2>&1; then
   MODE="update"
 fi
-log "Mode: $MODE"
+if [[ "$LIST_VERSIONS" != true && "$SHOW_CURRENT_VERSION" != true ]]; then
+  log "Mode: $MODE"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1 — interactive prompts (only if flags weren't passed and it's a fresh install)
 # ---------------------------------------------------------------------------
-if [[ "$MODE" == "install" ]]; then
+if [[ "$MODE" == "install" && "$LIST_VERSIONS" != true && "$SHOW_CURRENT_VERSION" != true ]]; then
+  if [[ -z "$DOMAIN" && "$INTERACTIVE" == true ]]; then
+    read -rp "Domain name JumpServer will be reached at (e.g. jumpserver.Google.ae): " DOMAIN
+  fi
   if [[ -z "$ORG_NAME" && "$INTERACTIVE" == true ]]; then
     read -rp "Organization name (shown on dashboard): " ORG_NAME
   fi
@@ -164,6 +191,13 @@ if [[ "$MODE" == "install" ]]; then
     S3_REGION="${S3_REGION:-eu-central-1}"
   fi
   ORG_NAME="${ORG_NAME:-Org}"
+  if [[ -z "$DOMAIN" ]]; then
+    warn "No --domain given (and not running --interactive, so nothing was prompted)."
+    warn "Without it, DOMAINS won't be set in JumpServer's config, which is very likely to"
+    warn "cause 'CSRF: Origin checking failed' once you access it over HTTPS through a real"
+    warn "domain — that's exactly what happened on log-server-eu. Strongly recommend"
+    warn "re-running with --domain yourdomain.example, or --interactive to be asked."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -454,6 +488,17 @@ apply_lion_audio_fix() {
   mkdir -p "$fix_dir"
 
   cat > "${fix_dir}/nginx.conf" <<'NGINXEOF'
+# Preserve whatever X-Forwarded-Proto the real front door (load balancer /
+# TLS terminator) already set, rather than overwriting it with $scheme —
+# this sidecar only ever sees plain HTTP internally, so $scheme here is
+# always "http" even when the original request was HTTPS. Overwriting it
+# unconditionally broke Django's CSRF Origin check (it started believing
+# every request was HTTP, causing "does not match any trusted origins").
+map $http_x_forwarded_proto $accessrig_forwarded_proto {
+    default $http_x_forwarded_proto;
+    ''      $scheme;
+}
+
 server {
     listen 80;
     location /lion/ws/connect/ {
@@ -469,7 +514,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $accessrig_forwarded_proto;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
@@ -481,7 +526,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $accessrig_forwarded_proto;
     }
 }
 NGINXEOF
@@ -589,6 +634,86 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# DOMAINS — this is what fixes "CSRF Failed: Origin checking failed", the
+# real bug hit on log-server-eu. JumpServer's shared config.txt (symlinked
+# as .env into each versioned installer directory) has a DOMAINS variable
+# specifically for this — Django's CSRF Origin check trusts whatever's
+# listed there. Confirmed from JumpServer's own quick-start documentation.
+# Idempotent: only edits + restarts if the value is actually different.
+# ---------------------------------------------------------------------------
+configure_domain() {
+  [[ -n "$DOMAIN" ]] || return 0
+  [[ "$LAYOUT" == "jumpserver-installer" ]] || return 0
+  [[ -f "$REAL_ENV_FILE" ]] || return 0
+
+  local current_domains
+  current_domains="$(grep '^DOMAINS=' "$REAL_ENV_FILE" 2>/dev/null | cut -d= -f2- || echo "")"
+  if [[ "$current_domains" == "$DOMAIN" ]]; then
+    log "DOMAINS already set to ${DOMAIN} — nothing to do."
+    return 0
+  fi
+
+  log "Setting DOMAINS=${DOMAIN} (fixes CSRF Origin checking for this domain)..."
+  if grep -q '^DOMAINS=' "$REAL_ENV_FILE" 2>/dev/null; then
+    sed -i.accessrig-bak "s|^DOMAINS=.*|DOMAINS=${DOMAIN}|" "$REAL_ENV_FILE"
+  else
+    echo "DOMAINS=${DOMAIN}" >> "$REAL_ENV_FILE"
+  fi
+
+  restart_jumpserver "DOMAINS change"
+}
+
+# ---------------------------------------------------------------------------
+# Timezone + language — same shared config file, same idempotent pattern.
+# ---------------------------------------------------------------------------
+configure_locale() {
+  [[ "$LAYOUT" == "jumpserver-installer" ]] || return 0
+  [[ -f "$REAL_ENV_FILE" ]] || return 0
+
+  local changed=false
+  local current_tz current_lang
+  current_tz="$(grep '^TIME_ZONE=' "$REAL_ENV_FILE" 2>/dev/null | cut -d= -f2- || echo "")"
+  current_lang="$(grep '^LANGUAGE_CODE=' "$REAL_ENV_FILE" 2>/dev/null | cut -d= -f2- || echo "")"
+
+  if [[ -n "$TIMEZONE" && "$current_tz" != "$TIMEZONE" ]]; then
+    log "Setting TIME_ZONE=${TIMEZONE}..."
+    if grep -q '^TIME_ZONE=' "$REAL_ENV_FILE" 2>/dev/null; then
+      sed -i.accessrig-bak "s|^TIME_ZONE=.*|TIME_ZONE=${TIMEZONE}|" "$REAL_ENV_FILE"
+    else
+      echo "TIME_ZONE=${TIMEZONE}" >> "$REAL_ENV_FILE"
+    fi
+    changed=true
+  fi
+
+  if [[ -n "$LANGUAGE_CODE" && "$current_lang" != "$LANGUAGE_CODE" ]]; then
+    log "Setting LANGUAGE_CODE=${LANGUAGE_CODE}..."
+    if grep -q '^LANGUAGE_CODE=' "$REAL_ENV_FILE" 2>/dev/null; then
+      sed -i.accessrig-bak "s|^LANGUAGE_CODE=.*|LANGUAGE_CODE=${LANGUAGE_CODE}|" "$REAL_ENV_FILE"
+    else
+      echo "LANGUAGE_CODE=${LANGUAGE_CODE}" >> "$REAL_ENV_FILE"
+    fi
+    changed=true
+  fi
+
+  [[ "$changed" == true ]] && restart_jumpserver "timezone/language change"
+}
+
+# Shared restart helper — uses jmsctl.sh itself rather than raw docker
+# compose, since jmsctl.sh's own commands are confirmed (against a live box,
+# earlier tonight) to correctly export variables that our own direct compose
+# calls sometimes couldn't resolve (CONFIG_DIR/CONFIG_FILE/etc.).
+restart_jumpserver() {
+  local reason="${1:-config change}"
+  if [[ -f "${REAL_INSTALLER_DIR}/jmsctl.sh" ]]; then
+    log "Restarting JumpServer to apply the ${reason} (via jmsctl.sh restart)..."
+    ( cd "$REAL_INSTALLER_DIR" && chmod +x ./jmsctl.sh && ./jmsctl.sh restart ) \
+      || warn "jmsctl.sh restart failed — apply the ${reason} manually: cd ${REAL_INSTALLER_DIR} && ./jmsctl.sh restart"
+  else
+    warn "No jmsctl.sh found — restart JumpServer manually to apply the ${reason}."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Fresh install flow
 # ---------------------------------------------------------------------------
 do_install() {
@@ -596,43 +721,45 @@ do_install() {
   ensure_docker
   ensure_jq
 
-  mkdir -p "$ACCESSRIG_HOME" "$ACCESSRIG_STATE_DIR" "$BACKUP_DIR"
-
   local target_tag="${FORCE_VERSION:-$(latest_upstream_tag)}"
-  log "Installing JumpServer ${target_tag}"
-
-  # Pre-seed language + timezone before first boot so the whole stack (core,
-  # koko, lion, celery) comes up already in the right locale — this is the
-  # config JumpServer reads on container init, and it persists because
-  # /opt/jumpserver is a bind mount, not a container-internal path.
-  mkdir -p "${ACCESSRIG_HOME}/config"
-  cat > "${ACCESSRIG_HOME}/config/config.yml" <<EOF
-LANGUAGE_CODE: ${LANGUAGE_CODE}
-USE_I18N: true
-TIME_ZONE: ${TIMEZONE}
-EOF
+  log "Installing JumpServer ${target_tag} (jumpserver-installer layout)"
 
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry-run] Would download quick_start.sh (tag ${target_tag}) and run it."
-  else
-    curl -fsSL "https://github.com/jumpserver/jumpserver/releases/download/${target_tag}/quick_start.sh" \
-      -o /tmp/quick_start.sh
-    chmod +x /tmp/quick_start.sh
-    ( cd "${ACCESSRIG_HOME}" && /tmp/quick_start.sh )
+    log "[dry-run] Would download jumpserver-installer-${target_tag}.tar.gz, extract to /opt,"
+    log "[dry-run] run jmsctl.sh install && jmsctl.sh start, then set DOMAINS/locale/audio-fix."
+    return
   fi
 
-  # Write the install marker — this is what flips future runs into update mode.
-  cat > "$ACCESSRIG_MARKER" <<EOF
-{
-  "installed_version": "${target_tag}",
-  "org_name": "${ORG_NAME}",
-  "timezone": "${TIMEZONE}",
-  "language": "${LANGUAGE_CODE}",
-  "s3_bucket": "${S3_BUCKET}",
-  "s3_region": "${S3_REGION}",
-  "installed_at": "$(date -u +%FT%TZ)"
-}
-EOF
+  local tarball="jumpserver-installer-${target_tag}.tar.gz"
+  local download_url="https://github.com/${INSTALLER_REPO}/releases/download/${target_tag}/${tarball}"
+  log "Downloading ${download_url}"
+  ( cd /opt && curl -fsSL -O "$download_url" )
+
+  local new_dir="/opt/jumpserver-installer-${target_tag}"
+  log "Extracting to ${new_dir}"
+  ( cd /opt && tar -zxf "$tarball" )
+  [[ -d "$new_dir" ]] || die "Expected ${new_dir} to exist after extracting ${tarball} but it doesn't — check the tarball's actual top-level directory name."
+
+  log "Running jmsctl.sh install..."
+  log "NOTE: this may show a (y/n) confirmation prompt — auto-confirming with 'y' for unattended runs."
+  log "Re-run with --interactive if you'd rather answer it yourself. This is the first time"
+  log "AccessRig has driven a truly fresh jmsctl.sh install (upgrade was verified earlier"
+  log "tonight against a live box; a from-scratch install hasn't been separately confirmed"
+  log "the same way) — worth watching this run rather than assuming it's silent-safe."
+  (
+    cd "$new_dir"
+    chmod +x ./jmsctl.sh
+    if [[ "$INTERACTIVE" == true ]]; then
+      ./jmsctl.sh install
+    else
+      printf 'y\n' | ./jmsctl.sh install
+    fi
+  ) || die "jmsctl.sh install failed — check the output above. Nothing else was touched."
+
+  log "Starting services..."
+  ( cd "$new_dir" && ./jmsctl.sh start ) || die "jmsctl.sh start failed — check container status with: docker ps"
+
+  log "Install complete. Applying domain/locale config and the GUAC_AUDIO fix..."
 
   if [[ -n "$S3_BUCKET" ]]; then
     warn "S3 recording storage still needs the one-time UI step — JumpServer Community"
@@ -657,12 +784,26 @@ EOF
     fi
   fi
 
-  log "Install complete. UI: http://$(curl -s ifconfig.me 2>/dev/null || echo '<ec2-ip>')"
-  log "Org name, timezone, S3 target are all recorded in ${ACCESSRIG_MARKER} for next time."
-
-  ensure_jq
+  # Re-detect now that containers actually exist, then apply everything else.
   detect_real_layout
-  apply_lion_audio_fix
+  configure_domain
+  configure_locale
+  if [[ "$ENABLE_AUDIO_FIX" == true ]]; then
+    apply_lion_audio_fix
+  else
+    log "Skipping the GUAC_AUDIO/RDP-black-screen fix (opt-in, off by default for a clean"
+    log "fresh setup — it adds a sidecar container and moves jms_web's port). If RDP"
+    log "sessions show a black screen later, re-run with --apply-audio-fix."
+  fi
+
+  log "Install complete."
+  if [[ -n "$DOMAIN" ]]; then
+    log "UI: https://${DOMAIN}  (assuming TLS termination is set up in front of this box)"
+  else
+    log "UI: http://$(curl -s ifconfig.me 2>/dev/null || echo '<ec2-ip>')"
+    warn "No --domain was set — if you access this over HTTPS through a real domain later,"
+    warn "re-run with --domain to avoid the CSRF Origin-checking error."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -689,8 +830,16 @@ do_update() {
 
   # Re-detect: an installer-layout upgrade just moved to a NEW versioned
   # directory, so REAL_INSTALLER_DIR from before the upgrade is stale.
+  # configure_locale is intentionally NOT called here — it would silently
+  # reapply the default timezone/language on every update run even if you'd
+  # since changed it via the UI, since those flags default to non-empty
+  # values. configure_domain is safe here since it only acts when --domain
+  # is explicitly passed on this specific run.
   detect_real_layout
-  apply_lion_audio_fix
+  configure_domain
+  if [[ "$ENABLE_AUDIO_FIX" == true ]]; then
+    apply_lion_audio_fix
+  fi
 }
 
 do_update_jumpserver_installer() {
@@ -809,6 +958,17 @@ do_update_legacy() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+if [[ "$SHOW_CURRENT_VERSION" == true ]]; then
+  detect_real_layout
+  if [[ -n "$CURRENT_VERSION_FROM_DOCKER" ]]; then
+    echo "$CURRENT_VERSION_FROM_DOCKER"
+  else
+    echo "Not installed (or jms_core isn't running) on this box." >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 if [[ "$LIST_VERSIONS" == true ]]; then
   ensure_jq
   list_versions

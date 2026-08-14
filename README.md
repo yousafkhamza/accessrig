@@ -2,18 +2,19 @@
 
 By **Yousaf Hamza** ([github.com/yousafkhamza](https://github.com/yousafkhamza)) — repo: [github.com/yousafkhamza/accessrig](https://github.com/yousafkhamza/accessrig)
 
-A one-command installer/updater for [JumpServer](https://github.com/jumpserver/jumpserver) on a fresh Ubuntu EC2 box — dependency checks (git, Docker Engine, compose plugin), S3 recording setup guidance, org-name branding, timezone/locale, and safe in-place upgrades that never touch your data.
+A one-command installer/updater for [JumpServer](https://github.com/jumpserver/jumpserver) on a fresh Ubuntu/Amazon Linux EC2 box — dependency checks (git, Docker Engine, compose plugin), domain/CSRF config, S3 recording setup guidance, org-name branding, timezone/locale, the RDP black-screen fix, and safe in-place upgrades, all in one idempotent script.
 
 **All credit for JumpServer itself goes to [Fit2Cloud](https://fit2cloud.com) and the [JumpServer open-source project](https://github.com/jumpserver/jumpserver)** — an open-source Bastion Host / Privileged Access Management (PAM) platform. AccessRig is just a thin, opinionated deployment wrapper around it; it doesn't fork or modify JumpServer's code.
 
 ## Why this exists
 
-The official quick-start is great but leaves a few things manual every time: Docker Engine + compose-plugin setup on a fresh box, forcing English UI, timezone, S3 recording storage, and — critically — there's no single blessed way to safely re-run it later as an *upgrade* without a checklist. AccessRig wraps all of that into one idempotent script.
+The official install tooling (`jmsctl.sh`, from JumpServer's own `installer` repo) is solid but leaves a few things manual every time: Docker Engine setup on a fresh box, the `DOMAINS` config that prevents CSRF errors once you're behind a real domain, timezone/locale, the GUAC_AUDIO RDP black-screen bug, and — critically — no single command that safely does install-or-upgrade without you having to know which one applies. AccessRig wraps all of that into one idempotent script that detects and adapts to what's actually on the box, verified against a live deployment rather than assumed.
 
 ## Install (fresh EC2 box)
 
 ```bash
 curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
+  --domain "jumpserver.Google.ae" \
   --org-name "Google" \
   --s3-bucket "jumpserver-recordings-prod" \
   --s3-region "eu-central-1" \
@@ -21,7 +22,13 @@ curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s --
   --language "en"
 ```
 
-Re-running the **same command** later automatically detects the existing install (via `/opt/jumpserver/.accessrig/install.json`) and switches to update mode instead — see below.
+Uses the real, officially-documented install mechanism — downloads the matching release from [`jumpserver/installer`](https://github.com/jumpserver/installer), extracts to a versioned `/opt/jumpserver-installer-v<X.Y.Z>/` directory, and runs `jmsctl.sh install` / `jmsctl.sh start`. Any `(y/n)` confirmation prompt is auto-answered `y` for unattended runs — pass `--interactive` to answer it yourself instead.
+
+**`--domain` matters more than it looks.** It sets `DOMAINS` in JumpServer's shared config, which is what Django's CSRF Origin check trusts. Skip it, and the first time you access JumpServer over HTTPS through a real domain you will very likely hit `CSRF Failed: Origin checking failed` — this happened for real during testing and is exactly why the flag exists. If you don't pass it, `--interactive` will prompt for it; skipping both prints a clear warning rather than failing silently.
+
+After install, domain config and locale are applied automatically — no separate steps. The GUAC_AUDIO fix is **not** applied by default (see below); add `--apply-audio-fix` if/when you actually hit that bug.
+
+Re-running the **same command** later automatically detects the existing install (by checking whether `jms_core` is actually running, not a bookkeeping file that can drift out of sync) and switches to update mode instead — see below.
 
 ## Update (in place, layout-aware, GUAC_AUDIO fix applied automatically)
 
@@ -67,8 +74,10 @@ Why the extra step: a backup is taken either way (same as any update), so a down
 
 ## Uninstall
 
+**Rewritten to match the real `jumpserver-installer` layout** — the previous version assumed the older single-directory `quick_start.sh` layout, which doesn't match how modern JumpServer actually deploys. Now uses `jmsctl.sh down` (the officially documented full-stop command) and correctly identifies the real data locations: `/opt/jumpserver/config` (shared config, secret keys, `DOMAINS`) and `/data/jumpserver` (the actual database/recordings). The versioned `/opt/jumpserver-installer-v*/` directories are closer to release bundles than data — safe to remove regardless.
+
 ```bash
-# Safe default: stops containers, leaves /opt/jumpserver (your data) untouched
+# Safe default: stops everything via jmsctl.sh down, leaves config + real data untouched
 curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash
 
 # Fully remove everything, including data — takes a final backup to
@@ -81,7 +90,7 @@ curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash -s 
 curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash -s -- --purge-data --remove-docker
 ```
 
-Data is never deleted by default — you have to explicitly opt in with `--purge-data`, and it still confirms before doing anything destructive unless you also pass `--yes`.
+Data is never deleted by default — you have to explicitly opt in with `--purge-data`, and it still confirms before doing anything destructive unless you also pass `--yes`. Also cleans up the `lion-audio-fix`/`branding-proxy` sidecars first, since they aren't part of `jmsctl.sh`'s own project and it wouldn't know about them otherwise.
 
 ## What gets automated vs. what's still manual
 
@@ -119,9 +128,13 @@ config/accessrig.env.example
 
 Server user provisioning (create `admin-pam`/`editor-pam`/`readonly-pam` via SSM) lives in a separate toolkit, not this repo — see [jms-user-provisioning](https://github.com/yousafkhamza/jms-user-provisioning).
 
-## The RDP black-screen bug (GUAC_AUDIO) — now fixed automatically
+## The RDP black-screen bug (GUAC_AUDIO) — opt-in, not automatic
 
-**As of the install.sh rewrite above, you don't need to do anything for this anymore** — it's applied automatically after install, after upgrade, and even on a plain re-run with nothing to upgrade. This section is background on what it does and how, plus the standalone script for ad-hoc use.
+**Off by default, including on a fresh install** — a clean setup shouldn't carry an extra sidecar container and a port move unless you actually need it. Add it explicitly when/if you hit the bug:
+
+```bash
+curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --apply-audio-fix
+```
 
 If RDP connections through JumpServer show a black screen and Lion's logs contain:
 
@@ -129,9 +142,9 @@ If RDP connections through JumpServer show a black screen and Lion's logs contai
 5.audio,1.1,31.audio/L16; instruction with bad Content: 5.audio,1.1,31.audio/L16
 ```
 
-This is a known upstream bug (matches [jumpserver/jumpserver#13156](https://github.com/jumpserver/jumpserver/issues/13156) and [#13799](https://github.com/jumpserver/jumpserver/issues/13799)) — Luna's client-side JS always appends `GUAC_AUDIO=audio/L8&GUAC_AUDIO=audio/L16` to every RDP connect request, and Lion's protocol parser chokes on it. There's no platform-level toggle for this; it isn't configurable from the JumpServer UI.
+This is a known upstream bug (matches [jumpserver/jumpserver#13156](https://github.com/jumpserver/jumpserver/issues/13156) and [#13799](https://github.com/jumpserver/jumpserver/issues/13799)) — Luna's client-side JS always appends `GUAC_AUDIO=audio/L8&GUAC_AUDIO=audio/L16` to every RDP connect request, and Lion's protocol parser chokes on it. There's no platform-level toggle for this; it isn't configurable from the JumpServer UI. That's when `--apply-audio-fix` is worth adding — not before.
 
-**Standalone script**, for cases outside the normal install/upgrade flow (e.g. removing it temporarily for unrelated maintenance):
+**Standalone script**, for the same fix outside the normal install/upgrade flow:
 
 ```bash
 sudo ./scripts/lion-audio-fix.sh                    # apply manually

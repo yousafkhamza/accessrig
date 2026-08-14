@@ -5,30 +5,36 @@
 # Usage:
 #   curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash
 #
+# Rewritten to match the REAL jumpserver-installer layout (versioned
+# /opt/jumpserver-installer-v<X.Y.Z>/ directories + persistent shared config
+# at /opt/jumpserver/config/, real data at /data/jumpserver/) — the previous
+# version of this script assumed the older single-directory quick_start.sh
+# layout, which doesn't match how modern JumpServer actually deploys.
+#
 # Default behavior is CONSERVATIVE:
-#   - Stops and removes the JumpServer containers + branding proxy sidecar.
-#   - Leaves /opt/jumpserver (your DB, redis data, config, recordings cache)
-#     untouched on disk, and takes a fresh backup tarball before doing anything
-#     destructive.
-#   - Does NOT remove Docker/git/jq from the box — other things may depend on them.
+#   - Runs `jmsctl.sh down` from the current installer directory (the
+#     officially documented full-stop command — stops everything, containers
+#     included, but does not touch the database volume or shared config).
+#   - Leaves /opt/jumpserver/config (shared config incl. SECRET_KEY,
+#     BOOTSTRAP_TOKEN, DOMAINS) and /data/jumpserver (real DB/recordings data)
+#     untouched on disk, and takes a fresh backup tarball before doing
+#     anything destructive.
+#   - Does NOT remove Docker/git/jq from the box — other things may depend on it.
 #
 # Flags:
-#   --purge-data       Also delete /opt/jumpserver from disk (after a final backup
-#                       to /root/accessrig-final-backup-<timestamp>.tar.gz unless
-#                       --no-backup is also passed). Requires typing "DELETE" to
-#                       confirm unless --yes is passed too.
+#   --purge-data       Also delete /opt/jumpserver-installer-v*/ directories,
+#                       /opt/jumpserver/config, AND /data/jumpserver (the real
+#                       database/recordings data) — this is a genuinely full
+#                       wipe, not just stopping containers. Takes a final
+#                       backup to /root/accessrig-final-backup-<timestamp>.tar.gz
+#                       first unless --no-backup is also passed. Requires
+#                       typing "DELETE" to confirm unless --yes is also passed.
 #   --remove-docker     Also uninstall Docker Engine + compose plugin from the box.
-#   --no-backup         Skip the final backup before --purge-data. Only takes effect
-#                       together with --purge-data.
+#   --no-backup         Skip the final backup before --purge-data.
 #   --yes               Skip the interactive "type DELETE to confirm" prompt.
 #   --dry-run           Print what would happen, change nothing.
 #
 set -euo pipefail
-
-ACCESSRIG_HOME="/opt/jumpserver"
-ACCESSRIG_STATE_DIR="${ACCESSRIG_HOME}/.accessrig"
-ACCESSRIG_MARKER="${ACCESSRIG_STATE_DIR}/install.json"
-BRANDING_PROXY_DIR="${ACCESSRIG_STATE_DIR}/branding-proxy"
 
 PURGE_DATA=false
 REMOVE_DOCKER=false
@@ -87,52 +93,103 @@ run() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1 — stop and remove containers (JumpServer stack + AccessRig branding proxy)
+# Detect the current installer directory the same way install.sh does — via
+# Docker's own compose label, not a guessed path (the versioned directory
+# name changes on every upgrade).
 # ---------------------------------------------------------------------------
-if [[ -d "$ACCESSRIG_HOME" ]]; then
-  COMPOSE_FILE="${ACCESSRIG_HOME}/compose.yml"
-  [[ -f "$COMPOSE_FILE" ]] || COMPOSE_FILE="${ACCESSRIG_HOME}/docker-compose.yml"
-
-  if [[ -f "$COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; then
-    log "Stopping JumpServer containers..."
-    if [[ -f "${BRANDING_PROXY_DIR}/docker-compose.override.yml" ]]; then
-      run "docker compose -f '$COMPOSE_FILE' -f '${BRANDING_PROXY_DIR}/docker-compose.override.yml' down"
-    else
-      run "docker compose -f '$COMPOSE_FILE' down"
-    fi
-  else
-    warn "No compose file found under ${ACCESSRIG_HOME} — skipping container teardown."
+INSTALLER_DIR=""
+label_files="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' jms_core 2>/dev/null || true)"
+if [[ -n "$label_files" && "$label_files" != "<no value>" ]]; then
+  first_file="$(echo "$label_files" | cut -d',' -f1)"
+  if [[ -f "$first_file" ]]; then
+    INSTALLER_DIR="$(dirname "$(dirname "$first_file")")"
   fi
+fi
+
+if [[ -z "$INSTALLER_DIR" ]]; then
+  # Fall back to the newest-looking versioned directory on disk, if any.
+  INSTALLER_DIR="$(ls -d /opt/jumpserver-installer-v* 2>/dev/null | sort -V | tail -n1 || true)"
+fi
+
+if [[ -z "$INSTALLER_DIR" || ! -d "$INSTALLER_DIR" ]]; then
+  warn "Could not find a jumpserver-installer directory — JumpServer may not be installed,"
+  warn "or containers aren't currently running (label detection needs at least jms_core up)."
+  warn "Skipping container teardown. If you know the path, stop it manually with:"
+  warn "  cd /opt/jumpserver-installer-vX.Y.Z && ./jmsctl.sh down"
 else
-  warn "${ACCESSRIG_HOME} doesn't exist — JumpServer/AccessRig doesn't look installed on this box."
+  log "Found installer directory: ${INSTALLER_DIR}"
+
+  # ---------------------------------------------------------------------------
+  # Step 1 — remove any AccessRig sidecars first (they're not part of
+  # jmsctl.sh's own project, so `jmsctl.sh down` won't know about them).
+  # ---------------------------------------------------------------------------
+  for sidecar_dir in "${INSTALLER_DIR}/.accessrig/lion-audio-fix" "${INSTALLER_DIR}/.accessrig/branding-proxy"; do
+    if [[ -f "${sidecar_dir}/docker-compose.override.yml" ]]; then
+      sidecar_service="$(basename "$sidecar_dir" | sed 's/^/accessrig-/')"
+      log "Removing sidecar: ${sidecar_service}"
+      container_name="$(docker ps -a --filter "name=${sidecar_service}" --format '{{.Names}}' | head -n1)"
+      [[ -n "$container_name" ]] && run "docker rm -f '$container_name'"
+    fi
+  done
+
+  # ---------------------------------------------------------------------------
+  # Step 2 — the real, officially documented full-stop command.
+  # ---------------------------------------------------------------------------
+  if [[ -f "${INSTALLER_DIR}/jmsctl.sh" ]]; then
+    log "Running jmsctl.sh down (stops all containers, leaves data/config untouched)..."
+    run "( cd '$INSTALLER_DIR' && chmod +x ./jmsctl.sh && ./jmsctl.sh down )"
+  else
+    warn "No jmsctl.sh found in ${INSTALLER_DIR} — stopping containers directly instead."
+    run "docker ps -a --format '{{.Names}}' | grep '^jms_' | xargs -r docker rm -f"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2 — data handling
+# Step 3 — data handling. Real persistent data lives in TWO places:
+#   /opt/jumpserver/config    — shared config (SECRET_KEY, BOOTSTRAP_TOKEN, DOMAINS)
+#   /data/jumpserver          — the actual database/recordings/uploads data
+# The versioned /opt/jumpserver-installer-v*/ directories themselves are
+# closer to release bundles than data — safe to always remove those, they're
+# just re-downloaded on next install.
 # ---------------------------------------------------------------------------
 if [[ "$PURGE_DATA" == true ]]; then
-  if [[ "$SKIP_BACKUP" != true && -d "$ACCESSRIG_HOME" ]]; then
+  if [[ "$SKIP_BACKUP" != true ]]; then
     backup_file="/root/accessrig-final-backup-$(date +%s).tar.gz"
     log "Taking a final backup before deleting anything: ${backup_file}"
-    run "tar -czf '$backup_file' -C / opt/jumpserver"
-    log "Backup saved. Keep this somewhere safe if you might ever need this data again."
+    tar_targets=""
+    [[ -d /opt/jumpserver/config ]] && tar_targets="$tar_targets opt/jumpserver/config"
+    [[ -d /data/jumpserver ]] && tar_targets="$tar_targets data/jumpserver"
+    if [[ -n "$tar_targets" ]]; then
+      run "tar -czf '$backup_file' -C / $tar_targets"
+      log "Backup saved. Keep this somewhere safe if you might ever need this data again."
+    else
+      warn "Neither /opt/jumpserver/config nor /data/jumpserver exist — nothing to back up."
+    fi
   fi
 
   if [[ "$ASSUME_YES" != true && "$DRY_RUN" != true ]]; then
-    warn "This will permanently delete ${ACCESSRIG_HOME}, including the database, session"
-    warn "recordings cache, and all config. Type DELETE to confirm, anything else cancels."
+    warn "This will permanently delete:"
+    warn "  /opt/jumpserver-installer-v*/  (all versioned installer directories)"
+    warn "  /opt/jumpserver/config/        (shared config, secret keys, DOMAINS)"
+    warn "  /data/jumpserver/              (the real database, recordings, uploads)"
+    warn "Type DELETE to confirm, anything else cancels."
     read -rp "> " confirm
     [[ "$confirm" == "DELETE" ]] || die "Confirmation did not match. Nothing was deleted."
   fi
 
-  log "Removing ${ACCESSRIG_HOME}..."
-  run "rm -rf '$ACCESSRIG_HOME'"
+  log "Removing versioned installer directories..."
+  run "rm -rf /opt/jumpserver-installer-v*"
+  log "Removing shared config..."
+  run "rm -rf /opt/jumpserver"
+  log "Removing real data directory..."
+  run "rm -rf /data/jumpserver"
 else
-  log "Data left in place at ${ACCESSRIG_HOME} (pass --purge-data to remove it)."
+  log "Data left in place: /opt/jumpserver/config and /data/jumpserver (pass --purge-data to remove)."
+  log "Versioned installer directories under /opt/jumpserver-installer-v*/ also left as-is."
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — optionally remove Docker itself
+# Step 4 — optionally remove Docker itself
 # ---------------------------------------------------------------------------
 if [[ "$REMOVE_DOCKER" == true ]]; then
   log "Removing Docker Engine + compose plugin (${PKG_MGR:-unknown package manager})..."

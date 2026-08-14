@@ -3,47 +3,80 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AccessRig — one-command JumpServer deploys</title>
+<title>AccessRig — one-command JumpServer install/upgrade</title>
 <style>
-  :root { --bg:#0b0f14; --fg:#e6edf3; --muted:#8b98a5; --accent:#5ee0c0; }
+  :root { --bg:#0b0f14; --fg:#e6edf3; --muted:#8b98a5; --accent:#5ee0c0; --warn:#e0b95e; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font-family: -apple-system, "Segoe UI", Roboto, sans-serif; line-height:1.55; }
-  main { max-width: 760px; margin: 0 auto; padding: 64px 24px 96px; }
+  main { max-width: 820px; margin: 0 auto; padding: 64px 24px 96px; }
   h1 { font-size: 2rem; margin-bottom: 4px; }
+  h2 { margin-top: 44px; border-top: 1px solid #1f2733; padding-top: 28px; }
   p.tag { color: var(--muted); margin-top: 0; }
-  pre { background:#11161c; border:1px solid #1f2733; border-radius:8px; padding:16px; overflow-x:auto; }
+  pre { background:#11161c; border:1px solid #1f2733; border-radius:8px; padding:16px; overflow-x:auto; font-size: 0.9rem; }
   code { color: var(--accent); }
   .credit { border-left: 3px solid var(--accent); padding-left: 16px; color: var(--muted); margin: 32px 0; }
+  .note { border-left: 3px solid var(--warn); padding-left: 16px; color: var(--muted); margin: 20px 0; }
   a { color: var(--accent); }
-  table { width:100%; border-collapse: collapse; margin: 24px 0; }
-  td, th { text-align:left; padding: 8px 12px; border-bottom: 1px solid #1f2733; font-size: 0.92rem; }
+  table { width:100%; border-collapse: collapse; margin: 20px 0; }
+  td, th { text-align:left; padding: 8px 12px; border-bottom: 1px solid #1f2733; font-size: 0.9rem; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  code.flag { background:#11161c; padding: 2px 6px; border-radius: 4px; }
 </style>
 </head>
 <body>
 <main>
   <h1>AccessRig</h1>
-  <p class="tag">A one-command installer/updater for JumpServer on a fresh EC2 box.<br>By <a href="https://github.com/yousafkhamza" target="_blank">Yousaf Hamza</a></p>
+  <p class="tag">A one-command install/upgrade/uninstall wrapper for JumpServer on Ubuntu &amp; Amazon Linux EC2 boxes.<br>By <a href="https://github.com/yousafkhamza" target="_blank">Yousaf Hamza</a></p>
 
   <div class="credit">
     JumpServer is built and maintained by <a href="https://fit2cloud.com" target="_blank">Fit2Cloud</a> and the
     <a href="https://github.com/jumpserver/jumpserver" target="_blank">JumpServer open-source project</a>.
-    AccessRig is an independent deployment wrapper — it does not modify or redistribute JumpServer's code.
+    AccessRig is an independent deployment wrapper around the official <code>jmsctl.sh</code> tool from
+    <a href="https://github.com/jumpserver/installer" target="_blank">jumpserver/installer</a> — it doesn't fork or modify JumpServer's code.
   </div>
 
-  <h2>Install</h2>
+  <h2>Install (fresh box)</h2>
   <pre><code>curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
-  --org-name "Google" \
-  --s3-bucket "jumpserver-recordings-prod" \
-  --s3-region "eu-central-1" \
+  --domain "jumpserver.yourdomain.com" \
+  --org-name "YourOrg" \
   --timezone "Asia/Dubai" \
   --language "en"</code></pre>
+  <p>Checks/installs Docker if missing, downloads the matching release from <code>jumpserver/installer</code>, and runs the official <code>jmsctl.sh install</code> / <code>jmsctl.sh start</code>.</p>
 
-  <h2>Update (safe, in place)</h2>
+  <div class="note">
+    <strong><code class="flag">--domain</code> matters more than it looks.</strong> It sets <code>DOMAINS</code> in JumpServer's shared config —
+    what Django's CSRF Origin check actually trusts. Skip it, and the first time you access JumpServer over HTTPS through a
+    real domain you'll very likely hit <code>CSRF Failed: Origin checking failed</code>. Add <code>--interactive</code> to be prompted for it instead.
+  </div>
+
+  <h2>Update / upgrade (in place)</h2>
   <pre><code>curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash</code></pre>
-  <p>Auto-detects an existing install, backs up <code>/opt/jumpserver</code>, and upgrades in place.</p>
+  <p>Re-running the same command detects the existing install (by checking whether JumpServer is actually running, not a bookkeeping file) and switches to update mode — downloads the new version, runs <code>jmsctl.sh upgrade</code> (which takes its own DB backup automatically), then <code>jmsctl.sh start</code>.</p>
+
+  <h2>Version management</h2>
+  <table>
+    <tr><th><code class="flag">--list-versions</code></th><td>List recent upstream releases, marks which one (if any) is currently installed.</td></tr>
+    <tr><th><code class="flag">--current-version</code></th><td>Print just the currently installed version and exit.</td></tr>
+    <tr><th><code class="flag">--version &lt;tag&gt;</code></th><td>Pin install/update to a specific tag instead of always grabbing latest — also works as a force reinstall against the version you're already on.</td></tr>
+    <tr><th><code class="flag">--confirm-downgrade</code></th><td>Required alongside <code>--version</code> when the target is <em>older</em> than what's installed — downgrading a DB-backed app isn't automatically safe, so this is opt-in even though a backup is always taken either way.</td></tr>
+  </table>
+
+  <h2>Optional add-ons (off by default)</h2>
+  <p>Neither of these is applied automatically — a fresh setup stays clean unless you actually need them:</p>
+  <table>
+    <tr><th><code class="flag">--apply-audio-fix</code></th><td>Fixes the known GUAC_AUDIO / RDP black-screen bug in Lion's Guacamole parser. Adds a small reverse-proxy sidecar. Only worth adding if you actually hit the bug (RDP sessions connect then go black).</td></tr>
+    <tr><th><code class="flag">--enable-branding-proxy</code></th><td>Cosmetic org-name text substitution in the UI, since white-labeling is an Enterprise-only JumpServer feature. Purely visual, changes nothing functional.</td></tr>
+  </table>
+
+  <h2>Uninstall</h2>
+  <pre><code># Safe default — stops everything via jmsctl.sh down, leaves your data untouched
+curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash
+
+# Full wipe — takes a final backup first, asks you to type DELETE to confirm
+curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash -s -- --purge-data</code></pre>
 
   <h2>Full source</h2>
-  <p>See <a href="https://github.com/yousafkhamza/accessrig">the repository</a> for the full script, README, and IAM policy.</p>
+  <p>See <a href="https://github.com/yousafkhamza/accessrig">the repository</a> for the full scripts, README, and IAM policy.</p>
 </main>
 </body>
 </html>
