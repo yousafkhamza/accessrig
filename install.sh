@@ -431,11 +431,20 @@ apply_lion_audio_fix() {
   fi
 
   local fix_dir="${REAL_INSTALLER_DIR}/.accessrig/lion-audio-fix"
-  if [[ -f "${fix_dir}/docker-compose.override.yml" ]] && docker ps --format '{{.Names}}' | grep -qx "accessrig-lion-audio-fix"; then
-    log "GUAC_AUDIO fix sidecar is already running for this installer directory — nothing to do."
+  local sidecar_name sidecar_status
+  sidecar_name="$(docker ps -a --filter "name=accessrig-lion-audio-fix" --format '{{.Names}}' | head -n1)"
+  sidecar_status=""
+  [[ -n "$sidecar_name" ]] && sidecar_status="$(docker inspect --format '{{.State.Status}}' "$sidecar_name" 2>/dev/null || echo "")"
+
+  if [[ -f "${fix_dir}/docker-compose.override.yml" && "$sidecar_status" == "running" ]]; then
+    log "GUAC_AUDIO fix sidecar is running and healthy for this installer directory — nothing to do."
     return 0
   fi
-  if [[ -f "${fix_dir}/docker-compose.override.yml" ]]; then
+  if [[ -n "$sidecar_status" && "$sidecar_status" != "running" ]]; then
+    warn "The sidecar container (${sidecar_name}) exists but its status is '${sidecar_status}'"
+    warn "(not 'running' — possibly crash-looping). Removing it and reapplying cleanly."
+    docker rm -f "$sidecar_name" >/dev/null 2>&1 || true
+  elif [[ -f "${fix_dir}/docker-compose.override.yml" ]]; then
     warn "Found a fix config file here already, but the sidecar isn't actually running"
     warn "(likely left over from an earlier attempt, e.g. carried across by jmsctl.sh's"
     warn "upgrade migration) — reapplying properly rather than trusting the stale file."
@@ -477,6 +486,22 @@ server {
 }
 NGINXEOF
 
+  # Discover the REAL Docker network the live containers are actually on —
+  # referencing the generic "default" alias creates a NEW, separate network
+  # under an explicit project name instead of joining the real one, which
+  # breaks DNS resolution for jms_web/jms_lion from inside the sidecar
+  # (confirmed against a live box: "host not found in upstream jms_web").
+  local real_network
+  real_network="$(docker inspect jms_web --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}}{{end}}' 2>/dev/null | head -n1)"
+  if [[ -z "$real_network" ]]; then
+    warn "Could not determine the real Docker network jms_web is on — skipping the fix"
+    warn "rather than guessing, since the sidecar would just fail to resolve jms_web/jms_lion"
+    warn "the same way it just did. Check manually with:"
+    warn "  docker inspect jms_web --format '{{json .NetworkSettings.Networks}}'"
+    return 0
+  fi
+  log "Real network: ${real_network} — sidecar will join this one explicitly."
+
   cat > "${fix_dir}/docker-compose.override.yml" <<EOF
 services:
   accessrig-lion-audio-fix:
@@ -487,7 +512,12 @@ services:
     volumes:
       - ${fix_dir}/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     networks:
-      - default
+      - accessrig_real_net
+
+networks:
+  accessrig_real_net:
+    external: true
+    name: ${real_network}
 EOF
 
   local current_http_port
