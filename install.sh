@@ -12,7 +12,7 @@
 #
 # Usage (fresh box):
 #   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
-#       --org-name "Pay10" \
+#       --org-name "Google" \
 #       --s3-bucket "jumpserver-recordings-prod" \
 #       --s3-region "eu-central-1" \
 #       --timezone "Asia/Dubai" \
@@ -61,6 +61,46 @@ require_root() {
 }
 
 # ---------------------------------------------------------------------------
+# OS detection — Debian/Ubuntu (apt) vs. RHEL-family (dnf/yum), which covers
+# Amazon Linux 2023, RHEL, CentOS, Rocky, Alma. Detected once, used everywhere.
+# Defined before any call site, since this script also runs via `curl | bash`
+# (streamed execution — a call before its definition would fail there).
+# ---------------------------------------------------------------------------
+OS_ID=""
+OS_ID_LIKE=""
+PKG_FAMILY=""   # "debian" | "rhel"
+PKG_MGR=""      # "apt" | "dnf" | "yum"
+
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-}"
+    OS_ID_LIKE="${ID_LIKE:-}"
+  fi
+
+  if [[ "$OS_ID" =~ ^(ubuntu|debian)$ ]] || [[ "$OS_ID_LIKE" == *debian* ]]; then
+    PKG_FAMILY="debian"
+    PKG_MGR="apt"
+  elif [[ "$OS_ID" =~ ^(amzn|rhel|centos|rocky|almalinux|fedora)$ ]] || [[ "$OS_ID_LIKE" == *fedora* || "$OS_ID_LIKE" == *"rhel"* ]]; then
+    PKG_FAMILY="rhel"
+    PKG_MGR="dnf"
+    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
+  else
+    die "Unrecognized OS ($OS_ID). This script supports Debian/Ubuntu (apt) and RHEL-family / Amazon Linux (dnf/yum) only."
+  fi
+  log "Detected OS: ${OS_ID:-unknown} -> package family: ${PKG_FAMILY} (${PKG_MGR})"
+}
+
+pkg_install() {
+  case "$PKG_MGR" in
+    apt) apt-get update -y && apt-get install -y "$@" ;;
+    dnf) dnf install -y "$@" ;;
+    yum) yum install -y "$@" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Arg parsing
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -81,6 +121,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_root
+detect_os
 
 # ---------------------------------------------------------------------------
 # Step 0 — decide install vs update BEFORE asking anything
@@ -117,17 +158,10 @@ ensure_git() {
     return
   fi
   log "Installing git..."
-  apt-get update -y
-  apt-get install -y git
+  pkg_install git
 }
 
-ensure_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    log "Docker + compose plugin already present ($(docker --version))"
-    return
-  fi
-
-  log "Installing Docker Engine + compose plugin..."
+ensure_docker_debian() {
   apt-get remove -y docker docker-engine docker.io containerd runc || true
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg
@@ -143,17 +177,76 @@ ensure_docker() {
 
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+}
+
+ensure_docker_amzn() {
+  # Amazon Linux 2023 ships Docker directly in its own repos — the upstream
+  # Docker CE repo doesn't officially support AL2023, so we use dnf's build
+  # and add the Compose plugin separately (AL2023 doesn't package it).
+  dnf install -y docker
+  systemctl enable docker
+  systemctl start docker
+
+  local compose_dir="/usr/libexec/docker/cli-plugins"
+  mkdir -p "$compose_dir"
+  if [[ ! -x "${compose_dir}/docker-compose" ]]; then
+    local arch; arch="$(uname -m)"
+    [[ "$arch" == "aarch64" ]] && arch="aarch64" || arch="x86_64"
+    curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}" \
+      -o "${compose_dir}/docker-compose"
+    chmod +x "${compose_dir}/docker-compose"
+  fi
+}
+
+ensure_docker_rhel() {
+  # RHEL / CentOS / Rocky / Alma / Fedora — official Docker CE repo.
+  local repo_family="rhel"
+  [[ "$OS_ID" == "fedora" ]] && repo_family="fedora"
+
+  pkg_install dnf-plugins-core yum-utils 2>/dev/null || true
+  if command -v dnf >/dev/null 2>&1; then
+    dnf config-manager --add-repo "https://download.docker.com/linux/${repo_family}/docker-ce.repo"
+  else
+    yum-config-manager --add-repo "https://download.docker.com/linux/${repo_family}/docker-ce.repo"
+  fi
+  pkg_install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  systemctl enable docker
+  systemctl start docker
+}
+
+ensure_docker() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    log "Docker + compose plugin already present ($(docker --version))"
+    return
+  fi
+
+  log "Installing Docker Engine + compose plugin (${PKG_FAMILY})..."
+  case "$PKG_FAMILY" in
+    debian)
+      ensure_docker_debian
+      ;;
+    rhel)
+      if [[ "$OS_ID" == "amzn" ]]; then
+        ensure_docker_amzn
+      else
+        ensure_docker_rhel
+      fi
+      ;;
+  esac
 
   systemctl enable docker
   systemctl start docker
 
-  if id "ubuntu" >/dev/null 2>&1; then
-    usermod -aG docker ubuntu || true
-  fi
+  # Grant the box's default cloud-init user docker access, whichever it is.
+  for candidate_user in ec2-user ubuntu admin centos rocky; do
+    if id "$candidate_user" >/dev/null 2>&1; then
+      usermod -aG docker "$candidate_user" || true
+    fi
+  done
 }
 
 ensure_jq() {
-  command -v jq >/dev/null 2>&1 || { apt-get update -y && apt-get install -y jq; }
+  command -v jq >/dev/null 2>&1 || pkg_install jq
 }
 
 # ---------------------------------------------------------------------------
