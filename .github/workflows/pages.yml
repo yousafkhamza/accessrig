@@ -6,6 +6,7 @@ on:
     paths:
       - "docs/**"
       - "install.sh"
+      - "uninstall.sh"
       - "scripts/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -40,6 +41,7 @@ jobs:
           mkdir -p _site
           cp -r docs/. _site/
           cp install.sh _site/install.sh
+          cp uninstall.sh _site/uninstall.sh
           mkdir -p _site/scripts
           cp scripts/branding-proxy.sh _site/scripts/branding-proxy.sh
 

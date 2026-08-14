@@ -31,6 +31,44 @@ curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash
 
 What "zero data loss" actually means here: JumpServer's MySQL/Redis data and your config live under `/opt/jumpserver`, which is a bind mount on the host, not inside a container. Upgrading only replaces container images — it never deletes that directory. AccessRig additionally tars the whole directory to `/opt/jumpserver/backups/` before every upgrade attempt, so a failed upgrade has a one-command rollback path.
 
+## Choosing a specific version instead of always "latest"
+
+```bash
+# See what's available, and what's currently installed on this box
+curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --list-versions
+
+# Pin install/update to a specific tag
+curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --version v4.10.17
+```
+
+`--list-versions` fetches the last ~30 upstream releases straight from GitHub, marks pre-releases, and clearly flags whichever one is currently installed on this box — so you can deliberately sit on a known-good tag instead of blindly trusting "latest" (which can occasionally regress on any project).
+
+**Downgrading is protected, not blocked.** If the tag you pass to `--version` is *older* than what's currently installed, AccessRig detects that and refuses to proceed unless you also pass `--confirm-downgrade`:
+
+```bash
+curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --version v4.10.15 --confirm-downgrade
+```
+
+Why the extra step: a backup is taken either way (same as any update), so a downgrade is always *recoverable* — but it isn't automatically *safe* the way an upgrade normally is. JumpServer's database schema may have already migrated forward under the newer version, and there's no guarantee older application code works correctly against a newer schema. The confirmation flag exists so a downgrade only ever happens because you meant it to, not because a script silently picked an older tag for you.
+
+## Uninstall
+
+```bash
+# Safe default: stops containers, leaves /opt/jumpserver (your data) untouched
+curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash
+
+# Fully remove everything, including data — takes a final backup to
+# /root/accessrig-final-backup-<timestamp>.tar.gz first, then asks you to
+# type DELETE to confirm
+curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash -s -- --purge-data
+
+# Also uninstall Docker Engine itself (off by default — other things on the
+# box may depend on it)
+curl -fsSL https://yousafkhamza.github.io/accessrig/uninstall.sh | sudo bash -s -- --purge-data --remove-docker
+```
+
+Data is never deleted by default — you have to explicitly opt in with `--purge-data`, and it still confirms before doing anything destructive unless you also pass `--yes`.
+
 ## What gets automated vs. what's still manual
 
 | Item | Automated | Notes |
@@ -63,6 +101,8 @@ docs/index.html                     # GitHub Pages landing page
 config/accessrig.env.example
 .github/workflows/pages.yml         # deploys docs/ to GitHub Pages on every push to main
 ```
+
+Server user provisioning (create `admin-pam`/`editor-pam`/`readonly-pam` via SSM) lives in a separate toolkit, not this repo — see [jms-user-provisioning](https://github.com/yousafkhamza/jms-user-provisioning).
 
 ## Enabling GitHub Pages on your fork
 

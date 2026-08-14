@@ -23,6 +23,17 @@
 # against the latest upstream LTS release, backs up /opt/jumpserver, and upgrades
 # in place. No prompts are shown in that mode unless you pass --interactive.
 #
+# Version management:
+#   --list-versions          List recent upstream releases (marks which one, if
+#                             any, is currently installed on this box), then exit.
+#   --version <tag>           Pin install/update to a specific tag instead of
+#                             always grabbing "latest" (e.g. --version v4.10.17).
+#   --confirm-downgrade       Required in addition to --version when the target
+#                             tag is OLDER than what's currently installed — a
+#                             backup is still taken either way, but downgrading
+#                             a stateful, DB-backed app isn't automatically safe
+#                             the way upgrading normally is, so it's opt-in.
+#
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -46,6 +57,8 @@ TIMEZONE="Asia/Dubai"
 LANGUAGE_CODE="en"
 INTERACTIVE=false
 FORCE_VERSION=""     # pin to a specific tag instead of "latest"
+LIST_VERSIONS=false
+CONFIRM_DOWNGRADE=false
 ENABLE_BRANDING_PROXY=true
 DRY_RUN=false
 
@@ -111,6 +124,8 @@ while [[ $# -gt 0 ]]; do
     --timezone)     TIMEZONE="$2"; shift 2 ;;
     --language)     LANGUAGE_CODE="$2"; shift 2 ;;
     --version)      FORCE_VERSION="$2"; shift 2 ;;
+    --list-versions) LIST_VERSIONS=true; shift ;;
+    --confirm-downgrade) CONFIRM_DOWNGRADE=true; shift ;;
     --no-branding-proxy) ENABLE_BRANDING_PROXY=false; shift ;;
     --interactive)  INTERACTIVE=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
@@ -261,6 +276,49 @@ current_installed_tag() {
   docker inspect --format '{{.Config.Image}}' jms_core 2>/dev/null | awk -F: '{print $NF}' || echo ""
 }
 
+# List the last ~30 upstream releases, marking which (if any) is currently
+# installed on this box, so you can deliberately pin to a specific stable
+# tag instead of always trusting "latest" — some recent tags on any project
+# can have regressions, and you may want to sit on a known-good version.
+list_versions() {
+  local installed=""
+  if [[ -f "$ACCESSRIG_MARKER" ]]; then
+    installed="$(jq -r '.installed_version // empty' "$ACCESSRIG_MARKER" 2>/dev/null || echo "")"
+  fi
+
+  log "Currently installed on this box: ${installed:-none — fresh box}"
+  log "Fetching recent JumpServer releases from GitHub..."
+  echo ""
+  printf "%-22s %-14s %s\n" "TAG" "PUBLISHED" "NOTE"
+  curl -fsSL "https://api.github.com/repos/${JUMPSERVER_REPO}/releases?per_page=30" \
+    | jq -r '.[] | [.tag_name, (.published_at // "" | split("T")[0]), (.prerelease | tostring)] | @tsv' \
+    | while IFS=$'\t' read -r tag published prerelease; do
+        note=""
+        [[ "$prerelease" == "true" ]] && note="pre-release"
+        if [[ -n "$installed" && "$tag" == "$installed" ]]; then
+          note="${note:+$note, }CURRENTLY INSTALLED"
+        fi
+        printf "%-22s %-14s %s\n" "$tag" "$published" "$note"
+      done
+  echo ""
+  log "Install/pin a specific one with: --version <tag>   (e.g. --version v4.10.17)"
+}
+
+# Compares two version tags (handles v-prefix and -lts suffix). Returns
+# success (0) if $1 is strictly older than $2 — used to detect a downgrade
+# and require explicit confirmation before proceeding, since a backup makes
+# a downgrade RECOVERABLE but doesn't make it automatically safe: JumpServer's
+# DB schema may already have migrated forward and isn't guaranteed to work
+# against an older release's code.
+version_lt() {
+  local a="${1#v}" b="${2#v}"
+  a="${a%-lts}"; b="${b%-lts}"
+  [[ "$a" == "$b" ]] && return 1
+  local lowest
+  lowest="$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)"
+  [[ "$lowest" == "$a" ]]
+}
+
 # ---------------------------------------------------------------------------
 # Fresh install flow
 # ---------------------------------------------------------------------------
@@ -350,7 +408,20 @@ do_update() {
     return
   fi
 
-  log "Upgrading JumpServer ${installed} -> ${target_tag}"
+  if version_lt "$target_tag" "$installed"; then
+    warn "Target version ${target_tag} is OLDER than the currently installed ${installed} — this is a DOWNGRADE."
+    warn "A backup will still be taken first, so this is recoverable, but it is not automatically"
+    warn "safe: JumpServer's database schema may have already migrated forward with ${installed}"
+    warn "and isn't guaranteed to work correctly against ${target_tag}'s older code."
+    if [[ "$CONFIRM_DOWNGRADE" != true ]]; then
+      die "Re-run with --confirm-downgrade added to proceed anyway, once you've read the warning above."
+    fi
+    warn "Proceeding with downgrade (--confirm-downgrade was passed)."
+  fi
+
+  local verb="Upgrading"
+  version_lt "$target_tag" "$installed" && verb="Downgrading"
+  log "${verb} JumpServer ${installed} -> ${target_tag}"
 
   local backup_file="${BACKUP_DIR}/pre-upgrade-${installed}-to-${target_tag}-$(date +%s).tar.gz"
   log "Backing up ${ACCESSRIG_HOME} (excluding backups/ itself) to ${backup_file}"
@@ -380,6 +451,12 @@ do_update() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+if [[ "$LIST_VERSIONS" == true ]]; then
+  ensure_jq
+  list_versions
+  exit 0
+fi
+
 if [[ "$MODE" == "install" ]]; then
   do_install
 else
