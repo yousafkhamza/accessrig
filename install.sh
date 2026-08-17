@@ -10,8 +10,14 @@
 # fresh EC2 box. Dependencies (git, Docker Engine, compose plugin) are checked and
 # installed automatically if missing — nothing is assumed to be on the box already.
 #
+# ALWAYS pass --version explicitly. Every example below does — this is
+# deliberate: silently grabbing "latest" means you don't know what you're
+# actually running until after the fact. Check what's available first:
+#   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --list-versions
+#
 # Usage (fresh box):
 #   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- \
+#       --version "v4.10.18" \
 #       --domain "jumpserver.google.com" \
 #       --org-name "google" \
 #       --s3-bucket "jumpserver-recordings-prod" \
@@ -25,30 +31,24 @@
 # you access JumpServer over HTTPS through a real domain — this happened for
 # real and is why this flag exists.
 #
-# The GUAC_AUDIO / RDP-black-screen fix is OFF by default, including on a
-# fresh install — it adds a sidecar container and moves jms_web's port,
-# which isn't something a clean setup should carry unless you actually hit
-# the bug. Add --apply-audio-fix if/when RDP sessions show a black screen:
-#   curl -fsSL https://yousafkhamza.github.io/accessrig/install.sh | sudo bash -s -- --apply-audio-fix
-#
-# Re-running the exact same command on a box that already has AccessRig/JumpServer
-# installed switches automatically into UPDATE mode: it checks the running version
-# against the latest upstream LTS release, backs up /opt/jumpserver, and upgrades
-# in place. No prompts are shown in that mode unless you pass --interactive.
+# Re-running the same command on a box that already has JumpServer switches
+# automatically into UPDATE mode (checked against real container state, not
+# a bookkeeping file). No prompts are shown in that mode unless you pass
+# --interactive.
 #
 # Version management:
-#   --list-versions          List recent upstream releases (marks which one, if
-#                             any, is currently installed on this box), then exit.
-#   --version <tag>           Pin install/update to a specific tag instead of
-#                             always grabbing "latest" (e.g. --version v4.10.17).
-#                             Also works as a "force upgrade/reinstall" to the
-#                             SAME version you're already on — useful to re-run
-#                             jmsctl.sh against an existing install.
-#   --confirm-downgrade       Required in addition to --version when the target
-#                             tag is OLDER than what's currently installed — a
-#                             backup is still taken either way, but downgrading
-#                             a stateful, DB-backed app isn't automatically safe
-#                             the way upgrading normally is, so it's opt-in.
+#   --list-versions            List recent upstream releases (marks which one, if
+#                               any, is currently installed on this box), then exit.
+#   --current-version           Print just the currently installed version and exit.
+#   --version <tag>              REQUIRED in every example — pins install/update to
+#                               a specific tag instead of silently grabbing "latest".
+#                               Also works as a force reinstall against the version
+#                               you're already on — useful to re-run jmsctl.sh.
+#   --confirm-downgrade          Required in addition to --version when the target
+#                               tag is OLDER than what's currently installed — a
+#                               backup is still taken either way, but downgrading
+#                               a stateful, DB-backed app isn't automatically safe
+#                               the way upgrading normally is, so it's opt-in.
 #
 set -euo pipefail
 
@@ -62,10 +62,6 @@ BACKUP_DIR="${ACCESSRIG_HOME}/backups"
 JUMPSERVER_REPO="jumpserver/jumpserver"          # upstream GitHub repo (quick_start.sh releases)
 INSTALLER_REPO="jumpserver/installer"            # separate repo: the jmsctl.sh-based installer tool
 QUICKSTART_URL_BASE="https://github.com/jumpserver/jumpserver/releases/latest/download"
-# Where to fetch sibling scripts (branding-proxy.sh) from when this file is run
-# via `curl | bash` — in that mode $0 has no real path, so a local relative
-# lookup won't find them. Override with ACCESSRIG_BASE_URL=... if you fork this.
-ACCESSRIG_BASE_URL="${ACCESSRIG_BASE_URL:-https://yousafkhamza.github.io/accessrig}"
 
 ORG_NAME=""
 DOMAIN=""
@@ -78,8 +74,6 @@ FORCE_VERSION=""     # pin to a specific tag instead of "latest"
 LIST_VERSIONS=false
 SHOW_CURRENT_VERSION=false
 CONFIRM_DOWNGRADE=false
-ENABLE_BRANDING_PROXY=false   # opt-in — cosmetic only, most setups don't need it
-ENABLE_AUDIO_FIX=false        # opt-in — extra sidecar/port-move, only needed if you actually hit the RDP black-screen bug
 DRY_RUN=false
 
 log()  { echo -e "\033[1;36m[accessrig]\033[0m $*"; }
@@ -148,9 +142,6 @@ while [[ $# -gt 0 ]]; do
     --list-versions) LIST_VERSIONS=true; shift ;;
     --current-version) SHOW_CURRENT_VERSION=true; shift ;;
     --confirm-downgrade) CONFIRM_DOWNGRADE=true; shift ;;
-    --enable-branding-proxy) ENABLE_BRANDING_PROXY=true; shift ;;
-    --no-branding-proxy) ENABLE_BRANDING_PROXY=false; shift ;;
-    --apply-audio-fix) ENABLE_AUDIO_FIX=true; shift ;;
     --interactive)  INTERACTIVE=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
     -h|--help)
@@ -175,6 +166,12 @@ elif [[ -f "${ACCESSRIG_HOME}/compose.yml" || -f "${ACCESSRIG_HOME}/docker-compo
 fi
 if [[ "$LIST_VERSIONS" != true && "$SHOW_CURRENT_VERSION" != true ]]; then
   log "Mode: $MODE"
+  if [[ -z "$FORCE_VERSION" ]]; then
+    warn "No --version passed — will grab whatever's currently latest. Recommended:"
+    warn "  check first with --list-versions, then pin explicitly with --version <tag>."
+  else
+    log "Target version: ${FORCE_VERSION}"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -449,203 +446,6 @@ detect_real_layout() {
 }
 
 # ---------------------------------------------------------------------------
-# The GUAC_AUDIO / RDP-black-screen fix, folded in from the standalone
-# lion-audio-fix.sh — applied automatically after install/update, and
-# idempotent (safe to run every time; skips if already applied). Only runs
-# on the jumpserver-installer layout, where the real container names
-# (jms_web, jms_lion) and the .env HTTP_PORT mechanism this depends on were
-# actually confirmed against a live deployment.
-# ---------------------------------------------------------------------------
-apply_lion_audio_fix() {
-  [[ "$LAYOUT" == "jumpserver-installer" ]] || return 0
-
-  if [[ -z "$REAL_PROJECT_NAME" ]]; then
-    warn "Could not determine the real Compose project name for this deployment"
-    warn "(the com.docker.compose.project label wasn't found on jms_core). Skipping"
-    warn "the GUAC_AUDIO fix rather than guessing — running compose commands with the"
-    warn "wrong project name can create a rival network or duplicate containers."
-    warn "Check manually with: docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project\" }}' jms_core"
-    return 0
-  fi
-
-  local fix_dir="${REAL_INSTALLER_DIR}/.accessrig/lion-audio-fix"
-  local sidecar_name sidecar_status
-  sidecar_name="$(docker ps -a --filter "name=accessrig-lion-audio-fix" --format '{{.Names}}' | head -n1)"
-  sidecar_status=""
-  [[ -n "$sidecar_name" ]] && sidecar_status="$(docker inspect --format '{{.State.Status}}' "$sidecar_name" 2>/dev/null || echo "")"
-
-  if [[ -f "${fix_dir}/docker-compose.override.yml" && "$sidecar_status" == "running" ]]; then
-    log "GUAC_AUDIO fix sidecar is running and healthy for this installer directory — nothing to do."
-    return 0
-  fi
-  if [[ -n "$sidecar_status" && "$sidecar_status" != "running" ]]; then
-    warn "The sidecar container (${sidecar_name}) exists but its status is '${sidecar_status}'"
-    warn "(not 'running' — possibly crash-looping). Removing it and reapplying cleanly."
-    docker rm -f "$sidecar_name" >/dev/null 2>&1 || true
-  elif [[ -f "${fix_dir}/docker-compose.override.yml" ]]; then
-    warn "Found a fix config file here already, but the sidecar isn't actually running"
-    warn "(likely left over from an earlier attempt, e.g. carried across by jmsctl.sh's"
-    warn "upgrade migration) — reapplying properly rather than trusting the stale file."
-  fi
-
-  log "Applying the GUAC_AUDIO / RDP black-screen fix (audio strip proxy)..."
-  mkdir -p "$fix_dir"
-
-  cat > "${fix_dir}/nginx.conf" <<'NGINXEOF'
-# Preserve whatever X-Forwarded-Proto the real front door (load balancer /
-# TLS terminator) already set, rather than overwriting it with $scheme —
-# this sidecar only ever sees plain HTTP internally, so $scheme here is
-# always "http" even when the original request was HTTPS. Overwriting it
-# unconditionally broke Django's CSRF Origin check (it started believing
-# every request was HTTP, causing "does not match any trusted origins").
-map $http_x_forwarded_proto $accessrig_forwarded_proto {
-    default $http_x_forwarded_proto;
-    ''      $scheme;
-}
-
-server {
-    listen 80;
-    # Required because the location below uses variables in proxy_pass
-    # ($uri?$args, needed to strip GUAC_AUDIO) — that forces nginx into
-    # runtime DNS resolution instead of resolving once at config load, and
-    # runtime resolution needs an explicit resolver. 127.0.0.11 is Docker's
-    # own embedded DNS server, always present on any container network.
-    # Confirmed as the exact cause of "502 / no resolver defined to resolve
-    # jms_lion" against a live box.
-    resolver 127.0.0.11 valid=30s;
-    location /lion/ws/connect/ {
-        rewrite_by_lua_block {
-            local args = ngx.req.get_uri_args()
-            args["GUAC_AUDIO"] = nil
-            ngx.req.set_uri_args(args)
-        }
-        proxy_pass http://jms_lion:8081$uri?$args;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $accessrig_forwarded_proto;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-    location / {
-        proxy_pass http://jms_web:80;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $accessrig_forwarded_proto;
-    }
-}
-NGINXEOF
-
-  # Discover the REAL Docker network the live containers are actually on —
-  # referencing the generic "default" alias creates a NEW, separate network
-  # under an explicit project name instead of joining the real one, which
-  # breaks DNS resolution for jms_web/jms_lion from inside the sidecar
-  # (confirmed against a live box: "host not found in upstream jms_web").
-  local real_network
-  real_network="$(docker inspect jms_web --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}}{{end}}' 2>/dev/null | head -n1)"
-  if [[ -z "$real_network" ]]; then
-    warn "Could not determine the real Docker network jms_web is on — skipping the fix"
-    warn "rather than guessing, since the sidecar would just fail to resolve jms_web/jms_lion"
-    warn "the same way it just did. Check manually with:"
-    warn "  docker inspect jms_web --format '{{json .NetworkSettings.Networks}}'"
-    return 0
-  fi
-  log "Real network: ${real_network} — sidecar will join this one explicitly."
-
-  cat > "${fix_dir}/docker-compose.override.yml" <<EOF
-services:
-  accessrig-lion-audio-fix:
-    image: openresty/openresty:alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-    volumes:
-      - ${fix_dir}/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    networks:
-      - accessrig_real_net
-
-networks:
-  accessrig_real_net:
-    external: true
-    name: ${real_network}
-EOF
-
-  local current_http_port
-  current_http_port="$(grep '^HTTP_PORT=' "$REAL_ENV_FILE" | cut -d= -f2 || echo 80)"
-  current_http_port="${current_http_port:-80}"
-  local alt_port=18080
-
-  # Pick up any OTHER env-like files in the installer directory too — some
-  # jumpserver-installer deployments split variables across a second file
-  # (commonly named static.env) beyond just .env. docker compose accepts
-  # multiple --env-file flags and merges them, so include whatever's there
-  # rather than assume .env is the only one — this is also what was causing
-  # the "CONFIG_DIR/VERSION/CONFIG_SAFE_FILE not set" warnings.
-  local compose_args=()
-  local ef
-  for ef in "${REAL_INSTALLER_DIR}/.env" "${REAL_INSTALLER_DIR}"/*.env; do
-    [[ -f "$ef" ]] && compose_args+=(--env-file "$ef")
-  done
-  # Critical: pin the project name to what the live deployment actually uses.
-  # Without this, Compose infers it from the "compose/" directory basename
-  # instead, and every command below operates in a different, wrong project —
-  # attempting to create a rival network instead of joining the real one.
-  # This was the actual cause of "Pool overlaps with other one on this
-  # address space" seen on a live box.
-  [[ -n "$REAL_PROJECT_NAME" ]] && compose_args+=(-p "$REAL_PROJECT_NAME")
-  for f in "${COMPOSE_FILES[@]}"; do
-    compose_args+=(-f "$f")
-  done
-
-  # Don't trust .env's declared port — check what jms_web is ACTUALLY bound
-  # to right now. A stale/interrupted earlier attempt can leave .env saying
-  # one thing while the running container still says another.
-  local real_web_port
-  real_web_port="$(docker port jms_web 80/tcp 2>/dev/null | head -n1 | awk -F: '{print $NF}')"
-
-  if [[ "$real_web_port" == "$alt_port" ]]; then
-    log "jms_web is genuinely already running on ${alt_port} — nothing to recreate."
-  else
-    if [[ "$current_http_port" != "$alt_port" ]]; then
-      log "Moving jms_web off host port 80: HTTP_PORT ${current_http_port} -> ${alt_port}"
-      sed -i.accessrig-bak --follow-symlinks "s/^HTTP_PORT=.*/HTTP_PORT=${alt_port}/" "$REAL_ENV_FILE"
-    else
-      warn "HTTP_PORT in .env already says ${alt_port}, but jms_web is still really on ${real_web_port:-80}"
-      warn "(a previous attempt updated the file but never actually recreated the container) —"
-      warn "recreating it now to match."
-    fi
-
-    # Target the actual web service specifically rather than every service,
-    # to minimize what gets touched — discovered by name pattern rather than
-    # assumed, since the container name (jms_web) isn't necessarily the same
-    # as the compose service key underneath.
-    local web_service
-    web_service="$(docker compose "${compose_args[@]}" config --services 2>/dev/null | grep -i 'web' | head -n1)"
-    if [[ -z "$web_service" ]]; then
-      warn "Could not discover the web service name from compose config — recreating everything"
-      warn "instead of just the web service. Compose only recreates what actually changed, so"
-      warn "already-healthy containers should be left alone regardless."
-      docker compose "${compose_args[@]}" up -d
-    else
-      log "Recreating '${web_service}' service on its new port..."
-      docker compose "${compose_args[@]}" up -d "$web_service"
-    fi
-  fi
-
-  log "Starting the audio-fix sidecar on port 80..."
-  docker compose "${compose_args[@]}" -f "${fix_dir}/docker-compose.override.yml" up -d accessrig-lion-audio-fix
-
-  log "GUAC_AUDIO fix applied. RDP connections should no longer black-screen."
-}
-
-# ---------------------------------------------------------------------------
 # DOMAINS — this is what fixes "CSRF Failed: Origin checking failed", the
 # real bug hit on log-server-eu. JumpServer's shared config.txt (symlinked
 # as .env into each versioned installer directory) has a DOMAINS variable
@@ -738,7 +538,7 @@ do_install() {
 
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] Would download jumpserver-installer-${target_tag}.tar.gz, extract to /opt,"
-    log "[dry-run] run jmsctl.sh install && jmsctl.sh start, then set DOMAINS/locale/audio-fix."
+    log "[dry-run] run jmsctl.sh install && jmsctl.sh start, then set DOMAINS/locale."
     return
   fi
 
@@ -771,7 +571,7 @@ do_install() {
   log "Starting services..."
   ( cd "$new_dir" && ./jmsctl.sh start ) || die "jmsctl.sh start failed — check container status with: docker ps"
 
-  log "Install complete. Applying domain/locale config and the GUAC_AUDIO fix..."
+  log "Install complete. Applying domain/locale config..."
 
   if [[ -n "$S3_BUCKET" ]]; then
     warn "S3 recording storage still needs the one-time UI step — JumpServer Community"
@@ -782,31 +582,10 @@ do_install() {
     warn "and attach the IAM policy in docs/s3-policy.json to the EC2 instance role."
   fi
 
-  if [[ "$ENABLE_BRANDING_PROXY" == true && -n "$ORG_NAME" ]]; then
-    local local_script="$(dirname "$0")/scripts/branding-proxy.sh"
-    if [[ -f "$local_script" ]]; then
-      bash "$local_script" "$ORG_NAME"
-    else
-      # We were run via curl | bash, so $0 has no usable path — fetch the sibling script instead.
-      if curl -fsSL "${ACCESSRIG_BASE_URL}/scripts/branding-proxy.sh" -o /tmp/branding-proxy.sh; then
-        bash /tmp/branding-proxy.sh "$ORG_NAME"
-      else
-        warn "Could not fetch branding-proxy.sh from ${ACCESSRIG_BASE_URL} — skipping cosmetic branding (install itself is unaffected)."
-      fi
-    fi
-  fi
-
   # Re-detect now that containers actually exist, then apply everything else.
   detect_real_layout
   configure_domain
   configure_locale
-  if [[ "$ENABLE_AUDIO_FIX" == true ]]; then
-    apply_lion_audio_fix
-  else
-    log "Skipping the GUAC_AUDIO/RDP-black-screen fix (opt-in, off by default for a clean"
-    log "fresh setup — it adds a sidecar container and moves jms_web's port). If RDP"
-    log "sessions show a black screen later, re-run with --apply-audio-fix."
-  fi
 
   log "Install complete."
   if [[ -n "$DOMAIN" ]]; then
@@ -823,10 +602,9 @@ do_install() {
 # jumpserver-installer layout uses the tool's own jmsctl.sh upgrade/start
 # (which does its own DB backup natively — verified from JumpServer's own
 # docs, no need to duplicate it). Legacy layout keeps the original
-# quick_start.sh-based flow. Either way, the GUAC_AUDIO fix is applied
-# automatically at the end — including when there's nothing to upgrade, so
-# boxes that installed via AccessRig before this fix existed get it just by
-# re-running this script.
+# quick_start.sh-based flow. Domain config is applied at the end either way —
+# including when there's nothing to upgrade, so re-running with --domain
+# later always applies it even without a version change.
 # ---------------------------------------------------------------------------
 do_update() {
   ensure_jq
@@ -849,9 +627,6 @@ do_update() {
   # is explicitly passed on this specific run.
   detect_real_layout
   configure_domain
-  if [[ "$ENABLE_AUDIO_FIX" == true ]]; then
-    apply_lion_audio_fix
-  fi
 }
 
 do_update_jumpserver_installer() {
@@ -860,7 +635,7 @@ do_update_jumpserver_installer() {
   target_tag="${FORCE_VERSION:-$(latest_upstream_tag)}"
 
   if [[ "$installed" != "unknown" ]] && ! version_lt "$installed" "$target_tag" && ! version_lt "$target_tag" "$installed"; then
-    log "Already on ${installed}. Nothing to upgrade — checking the GUAC_AUDIO fix is applied and stopping there."
+    log "Already on ${installed}. Nothing to upgrade."
     return
   fi
 

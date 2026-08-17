@@ -120,20 +120,7 @@ else
   log "Found installer directory: ${INSTALLER_DIR}"
 
   # ---------------------------------------------------------------------------
-  # Step 1 — remove any AccessRig sidecars first (they're not part of
-  # jmsctl.sh's own project, so `jmsctl.sh down` won't know about them).
-  # ---------------------------------------------------------------------------
-  for sidecar_dir in "${INSTALLER_DIR}/.accessrig/lion-audio-fix" "${INSTALLER_DIR}/.accessrig/branding-proxy"; do
-    if [[ -f "${sidecar_dir}/docker-compose.override.yml" ]]; then
-      sidecar_service="$(basename "$sidecar_dir" | sed 's/^/accessrig-/')"
-      log "Removing sidecar: ${sidecar_service}"
-      container_name="$(docker ps -a --filter "name=${sidecar_service}" --format '{{.Names}}' | head -n1)"
-      [[ -n "$container_name" ]] && run "docker rm -f '$container_name'"
-    fi
-  done
-
-  # ---------------------------------------------------------------------------
-  # Step 2 — the real, officially documented full-stop command.
+  # The real, officially documented full-stop command.
   # ---------------------------------------------------------------------------
   if [[ -f "${INSTALLER_DIR}/jmsctl.sh" ]]; then
     log "Running jmsctl.sh down (stops all containers, leaves data/config untouched)..."
@@ -145,7 +132,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — data handling. Real persistent data lives in TWO places:
+# Step 2 — data handling. Real persistent data lives in TWO places:
 #   /opt/jumpserver/config    — shared config (SECRET_KEY, BOOTSTRAP_TOKEN, DOMAINS)
 #   /data/jumpserver          — the actual database/recordings/uploads data
 # The versioned /opt/jumpserver-installer-v*/ directories themselves are
@@ -189,7 +176,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4 — optionally remove Docker itself
+# Step 3 — optionally remove Docker itself
 # ---------------------------------------------------------------------------
 if [[ "$REMOVE_DOCKER" == true ]]; then
   log "Removing Docker Engine + compose plugin (${PKG_MGR:-unknown package manager})..."
